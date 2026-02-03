@@ -1,0 +1,12 @@
+# Virtual environment
+.venv/
+
+# Build and distribution artifacts
+build/
+dist/
+
+# Log files
+locha_debug.log
+
+# Pyinstaller spec file
+*.spec
