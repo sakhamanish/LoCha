@@ -12,3 +12,14 @@ Install:
 
 
 
+
+
+Voice mode (optional):
+You can ask questions by voice and have answers read aloud. Everything runs offline on your computer.
+1. Install the voice packages: pip install sounddevice faster-whisper pyttsx3
+   (on Linux also install PortAudio and eSpeak, e.g. sudo apt install libportaudio2 libespeak1)
+2. Load a document as usual.
+3. Click "🎤 Speak", ask your question out loud, then click "⏹ Stop". LoCha transcribes it and asks it for you.
+4. Tick "🔊 Read answers aloud" to hear each answer. Use "Stop speaking" to cut it short.
+The first time you use voice input, the Whisper speech model (base.en, about 150 MB) is downloaded once and cached. After that it works without internet.
+If the voice packages are not installed, the voice controls are greyed out and the rest of the app works as before.
