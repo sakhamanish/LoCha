@@ -115,6 +115,29 @@ def _resample(audio: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:
     return np.interp(dst_t, src_t, audio).astype(np.float32)
 
 
+def _trim_silence(audio: np.ndarray, rate=TARGET_SAMPLE_RATE) -> np.ndarray:
+    """
+    Trims leading/trailing silence with a simple energy gate; returns an
+    empty array if the clip has no speech-level sound at all.
+
+    Used instead of faster-whisper's built-in VAD (vad_filter), which loads
+    onnxruntime; on Windows that crashes when torch/PySide6 DLLs are
+    already loaded in the process.
+    """
+    frame = rate // 50  # 20 ms
+    n = len(audio) // frame
+    if n == 0:
+        return audio[:0]
+    rms = np.sqrt(np.mean(audio[: n * frame].reshape(n, frame) ** 2, axis=1))
+    if rms.max() < 0.003:  # nothing louder than background hiss
+        return audio[:0]
+    active = np.where(rms > max(0.002, rms.max() * 0.05))[0]
+    pad = 15  # keep 300 ms around the speech
+    start = max(0, active[0] - pad) * frame
+    end = min(n, active[-1] + 1 + pad) * frame
+    return audio[start:end]
+
+
 class Transcriber:
     """Lazily loads the Whisper model on first use and reuses it."""
 
@@ -126,6 +149,7 @@ class Transcriber:
     def transcribe(self, audio: np.ndarray) -> str:
         if not STT_AVAILABLE:
             raise RuntimeError(f"Voice input is unavailable: {STT_IMPORT_ERROR}")
+        audio = _trim_silence(audio)
         if len(audio) < TARGET_SAMPLE_RATE // 2:  # under half a second
             return ""
 
@@ -144,7 +168,7 @@ class Transcriber:
                         f"that it works offline.\n\nDetails: {e}"
                     ) from e
             segments, _ = self._model.transcribe(
-                audio, language="en", beam_size=5, vad_filter=True
+                audio, language="en", beam_size=5, vad_filter=False
             )
             text = " ".join(seg.text.strip() for seg in segments).strip()
 
