@@ -27,7 +27,7 @@ You can ask questions by voice and have answers read aloud. Everything runs offl
    On Linux also install PortAudio and eSpeak, e.g. sudo apt install libportaudio2 libespeak1
 2. Load a document as usual.
 3. Click "🎤 Speak", ask your question out loud, then click "⏹ Stop".
-   LoCha shows what it heard in the question box. Check or edit it, then press Enter or Ask.
+   LoCha transcribes your question and answers it straight away; no need to press Ask.
 4. Tick "🔊 Read answers aloud" to hear each answer. Use "Stop speaking" to cut it short.
    While LoCha is answering or speaking, Speak is disabled so the microphone never records LoCha's own voice.
 The first time you use voice input, the Whisper speech model (small.en, about 480 MB) is downloaded once and cached. After that it works without internet.

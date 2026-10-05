@@ -441,16 +441,10 @@ class LoChaApp(QWidget):
                 "Didn't catch that. Click Speak and try again.</b>"
             )
             return
-        # Let the user check the transcript before it is sent: a misheard
-        # question would otherwise produce a confidently wrong answer.
+        # Send straight away; the transcript stays visible in the question
+        # box and is shown above the answer.
         self.question_input.setText(text)
-        self.question_input.setFocus()
-        self.question_input.selectAll()
-        self.status.setText(
-            "<b style='font-size:16px; color:#2E7D32;'>Heard your question. "
-            "Check it, then press Enter or Ask (edit it, or click Speak to "
-            "try again).</b>"
-        )
+        self.ask_question()
 
     def on_transcribe_error(self, msg):
         self.reset_mic_button()
