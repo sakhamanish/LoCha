@@ -35,6 +35,7 @@ class LoChaEngine:
         self.chat = []
         self.file_hash = None
         self.index_ready = False
+        self.document_text = ""
 
     def reset(self):
         logger.info("Resetting engine state")
@@ -44,6 +45,7 @@ class LoChaEngine:
         self.chat = []
         self.file_hash = None
         self.index_ready = False
+        self.document_text = ""
 
     def load_document(self, file_path: str):
         logger.info(f"Loading document: {file_path}")
@@ -65,6 +67,7 @@ class LoChaEngine:
         docs = loader.load()
         for d in docs:
             d.metadata["source"] = os.path.basename(file_path)
+        self.document_text = "\n".join(d.page_content for d in docs)
 
         splitter = RecursiveCharacterTextSplitter(
             chunk_size=800,

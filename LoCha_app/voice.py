@@ -3,8 +3,9 @@ Offline voice support for LoCha.
 
 - Speech-to-text: microphone capture via `sounddevice`, transcription via
   `faster-whisper` running locally on the CPU.
-- Text-to-speech: `pyttsx3`, which uses the voices installed in the OS
-  (SAPI5 on Windows, NSSpeechSynthesizer on macOS, eSpeak on Linux).
+- Text-to-speech: the voices installed in the OS. On Windows SAPI is driven
+  directly through `comtypes` (so speech can be stopped instantly);
+  elsewhere `pyttsx3` is used (NSSpeechSynthesizer on macOS, eSpeak on Linux).
 
 Everything runs on the local machine. The Whisper model is downloaded once
 from Hugging Face on first use and cached, exactly like the embedding model.
@@ -12,16 +13,20 @@ The voice dependencies are optional: if they are missing, LoCha still runs
 and the voice controls are disabled.
 """
 
+import os
 import re
 import sys
 import logging
 import threading
+from collections import Counter
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
 
-WHISPER_MODEL = "base.en"
+# small.en is noticeably more accurate than base.en for spoken questions.
+# Override with e.g. LOCHA_WHISPER_MODEL=base.en (faster) or medium.en.
+WHISPER_MODEL = os.environ.get("LOCHA_WHISPER_MODEL", "small.en")
 TARGET_SAMPLE_RATE = 16000  # Whisper expects 16 kHz mono audio
 MAX_RECORD_SECONDS = 60
 
@@ -138,13 +143,51 @@ def _trim_silence(audio: np.ndarray, rate=TARGET_SAMPLE_RATE) -> np.ndarray:
     return audio[start:end]
 
 
+_COMMON_WORDS = set("""
+a an and are as at be but by can do does for from has have how if in into is
+it its may more most no not of on or our so such than that the their then there
+these they this those to use used using was we what when where which who why
+will with you your yes also all any each both other one two three new page
+""".split())
+
+
+def extract_vocabulary(text: str, max_terms=40):
+    """
+    Picks the document's distinctive terms (product names, acronyms, codes),
+    i.e. words that appear capitalised but rarely in lower case. They are
+    given to Whisper as hints so it spells domain words the document's way.
+    """
+    words = re.findall(r"\b[A-Za-z][A-Za-z0-9\-]*[A-Za-z0-9]\b", text or "")
+    lower = Counter(w for w in words if w.islower())
+    capitalised = Counter(w for w in words if not w.islower())
+    candidates = [
+        (count, word) for word, count in capitalised.items()
+        if count >= 2
+        and lower.get(word.lower(), 0) * 3 <= count
+        and word.lower() not in _COMMON_WORDS
+    ]
+    terms, seen = [], set()
+    for _, word in sorted(candidates, key=lambda c: (-c[0], c[1])):
+        if word.lower() not in seen:
+            seen.add(word.lower())
+            terms.append(word)
+        if len(terms) == max_terms:
+            break
+    return terms
+
+
 class Transcriber:
     """Lazily loads the Whisper model on first use and reuses it."""
 
     def __init__(self, model_name=WHISPER_MODEL):
         self.model_name = model_name
         self._model = None
+        self._hotwords = None
         self._lock = threading.Lock()
+
+    def set_vocabulary(self, terms):
+        self._hotwords = ", ".join(terms) if terms else None
+        logger.info(f"Speech vocabulary hints: {self._hotwords}")
 
     def transcribe(self, audio: np.ndarray) -> str:
         if not STT_AVAILABLE:
@@ -164,11 +207,16 @@ class Transcriber:
                     raise RuntimeError(
                         f"Could not load the speech model '{self.model_name}'. "
                         "The first use of voice input needs an internet "
-                        "connection to download it (about 150 MB); after "
+                        "connection to download it; after "
                         f"that it works offline.\n\nDetails: {e}"
                     ) from e
             segments, _ = self._model.transcribe(
-                audio, language="en", beam_size=5, vad_filter=False
+                audio,
+                language="en",
+                beam_size=5,
+                vad_filter=False,
+                condition_on_previous_text=False,
+                hotwords=self._hotwords,
             )
             text = " ".join(seg.text.strip() for seg in segments).strip()
 
@@ -199,10 +247,11 @@ class Speaker:
     Speaks text with the OS voices. speak() blocks; stop() is thread-safe.
     Each Speaker is meant for a single utterance.
 
-    Text is spoken in sentence-sized chunks so stop() always takes effect at
-    the next chunk boundary. Where the driver reports words while they
-    are spoken (SAPI5 on Windows, NSSpeechSynthesizer on macOS), stop() also
-    interrupts mid-sentence. The Linux eSpeak driver synthesises a whole
+    On Windows, SAPI speaks asynchronously and stop() is polled every
+    100 ms, so speech stops almost immediately. Elsewhere (pyttsx3), text is
+    spoken in sentence-sized chunks so stop() always takes effect at the
+    next chunk boundary, or mid-sentence where the driver reports words as
+    they are spoken (macOS). The Linux eSpeak driver synthesises a whole
     chunk before playing it, so there the chunk boundary is the limit.
     """
 
@@ -215,7 +264,36 @@ class Speaker:
         chunks = _split_sentences(text)
         if not chunks:
             return
+        if sys.platform == "win32":
+            self._speak_windows(" ".join(chunks), chunks)
+        else:
+            self._speak_pyttsx3(chunks)
 
+    def _speak_windows(self, text, chunks):
+        import comtypes
+        import comtypes.client
+
+        SVSF_ASYNC, SVSF_PURGE, SVSF_IS_NOT_XML = 1, 2, 16
+        comtypes.CoInitialize()  # COM must be initialised in this thread
+        try:
+            try:
+                sapi = comtypes.client.CreateObject("SAPI.SpVoice", dynamic=True)
+            except Exception as e:
+                logger.warning(f"SAPI unavailable, using pyttsx3: {e}")
+                self._speak_pyttsx3(chunks)
+                return
+            if self._stop_requested.is_set():
+                return
+            sapi.Speak(text, SVSF_ASYNC | SVSF_IS_NOT_XML)
+            while not sapi.WaitUntilDone(100):
+                if self._stop_requested.is_set():
+                    sapi.Speak("", SVSF_ASYNC | SVSF_PURGE)  # cut speech off
+                    break
+            del sapi
+        finally:
+            comtypes.CoUninitialize()
+
+    def _speak_pyttsx3(self, chunks):
         # SAPI5 is a COM API; COM must be initialised in this worker thread.
         com_initialised = False
         if sys.platform == "win32":

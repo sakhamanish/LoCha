@@ -52,6 +52,9 @@ class LoadDocumentWorker(QObject):
                 f"{os.path.basename(self.file_path)}</span>"
             )
             engine.load_document(self.file_path)
+            transcriber.set_vocabulary(
+                voice.extract_vocabulary(engine.document_text)
+            )
             self.status_update.emit(
                 "<b style='font-size:16px; color:#2E7D32;'>Read and indexed successfully, ready to take questions.</b>"
             )
@@ -295,6 +298,7 @@ class LoChaApp(QWidget):
         self.voice_worker = None
         self.tts_worker = None
         self.tts_jobs = []  # keeps (thread, worker) alive until speech ends
+        self.asking = False
 
     # ---------------- Logic ----------------
     def load_document(self):
@@ -332,10 +336,14 @@ class LoChaApp(QWidget):
         self.worker = AskQuestionWorker(question)
         self.worker.moveToThread(self.thread)
 
+        self.asking = True
+        self.update_mic_state()
+
         self.thread.started.connect(self.worker.run)
         self.worker.status_update.connect(self.update_status)
         self.worker.result_ready.connect(self.display_answer)
         self.worker.error.connect(self.show_error)
+        self.worker.finished.connect(self.on_ask_finished)
         self.worker.finished.connect(self.thread.quit)
         self.worker.finished.connect(self.worker.deleteLater)
         self.thread.finished.connect(self.thread.deleteLater)
@@ -352,7 +360,28 @@ class LoChaApp(QWidget):
         if self.read_aloud_cb.isChecked() and engine.chat:
             self.speak(engine.chat[0]["answer"])
 
+    def on_ask_finished(self):
+        self.asking = False
+        self.update_mic_state()
+
     # ---------------- Voice ----------------
+    def update_mic_state(self):
+        """Speak is unavailable while an answer is generated or read aloud,
+        so the microphone never records LoCha's own voice."""
+        if not voice.STT_AVAILABLE or recorder.is_recording:
+            return
+        if self.mic_btn.text() != "🎤 Speak":  # transcribing
+            return
+        if self.asking:
+            self.mic_btn.setEnabled(False)
+            self.mic_btn.setToolTip("Wait for the answer")
+        elif self.tts_worker is not None:
+            self.mic_btn.setEnabled(False)
+            self.mic_btn.setToolTip("Wait for the answer to finish, or press Stop speaking")
+        else:
+            self.mic_btn.setEnabled(True)
+            self.mic_btn.setToolTip("Click, ask your question out loud, then click Stop")
+
     def toggle_recording(self):
         if recorder.is_recording:
             self.finish_recording()
@@ -402,7 +431,7 @@ class LoChaApp(QWidget):
     def reset_mic_button(self):
         self.mic_btn.setText("🎤 Speak")
         self.mic_btn.setStyleSheet(MIC_IDLE_STYLE)
-        self.mic_btn.setEnabled(True)
+        self.update_mic_state()
 
     def on_transcribed(self, text):
         self.reset_mic_button()
@@ -412,8 +441,16 @@ class LoChaApp(QWidget):
                 "Didn't catch that. Click Speak and try again.</b>"
             )
             return
+        # Let the user check the transcript before it is sent: a misheard
+        # question would otherwise produce a confidently wrong answer.
         self.question_input.setText(text)
-        self.ask_question()
+        self.question_input.setFocus()
+        self.question_input.selectAll()
+        self.status.setText(
+            "<b style='font-size:16px; color:#2E7D32;'>Heard your question. "
+            "Check it, then press Enter or Ask (edit it, or click Speak to "
+            "try again).</b>"
+        )
 
     def on_transcribe_error(self, msg):
         self.reset_mic_button()
@@ -434,11 +471,13 @@ class LoChaApp(QWidget):
         self.tts_worker = worker
         self.tts_jobs.append((thread, worker))
         self.stop_speaking_btn.setEnabled(True)
+        self.update_mic_state()
         thread.start()
 
     def stop_speaking(self):
         if self.tts_worker is not None:
             self.tts_worker.speaker.stop()
+            self.stop_speaking_btn.setEnabled(False)
 
     def on_speaking_finished(self, thread, worker):
         self.tts_jobs.remove((thread, worker))
@@ -447,6 +486,7 @@ class LoChaApp(QWidget):
         if worker is self.tts_worker:
             self.tts_worker = None
             self.stop_speaking_btn.setEnabled(False)
+            self.update_mic_state()
 
     def closeEvent(self, event):
         if recorder.is_recording:
