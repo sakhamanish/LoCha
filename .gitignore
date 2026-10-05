@@ -10,3 +10,6 @@ locha_debug.log
 
 # Pyinstaller spec file
 *.spec
+
+# Python bytecode cache
+__pycache__/

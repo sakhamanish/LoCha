@@ -17,7 +17,42 @@ from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_community.llms import Ollama
 from langchain.chains import ConversationalRetrievalChain
-from langchain.memory import ConversationBufferMemory
+from langchain.memory import ConversationBufferWindowMemory
+from langchain.prompts import PromptTemplate
+
+# ---------------- Prompts ----------------
+# The LangChain default answer prompt tells the model to say "I don't know"
+# whenever unsure, which small local models (llama3.2 3B) do for almost
+# every question. This one asks it to use whatever the excerpts contain.
+QA_PROMPT = PromptTemplate.from_template(
+    """You are LoCha, an assistant that answers questions about the user's document.
+Answer the question using the document excerpts below.
+- Use the information in the excerpts even if it only partly answers the question, and say what is not covered.
+- The question may have been spoken and transcribed, so it can contain small transcription errors; interpret it sensibly.
+- Only if none of the excerpts relate to the question, reply: "I couldn't find that in the document."
+- Do not invent facts that are not in the excerpts.
+
+Document excerpts:
+{context}
+
+Question: {question}
+Answer:"""
+)
+
+# Turns a follow-up ("what about the second one?") into a standalone
+# question. Small models tend to wrap the rewrite in chatter ("Here is the
+# rephrased question: ..."), hence the strict "question only" instruction.
+CONDENSE_PROMPT = PromptTemplate.from_template(
+    """Rewrite the follow-up question as a standalone question, using the conversation for context.
+If it is already a standalone question, repeat it unchanged.
+Reply with the question only, nothing else.
+
+Conversation:
+{chat_history}
+
+Follow-up question: {question}
+Standalone question:"""
+)
 
 # ---------------- Logging ----------------
 logging.basicConfig(
@@ -35,6 +70,7 @@ class LoChaEngine:
         self.chat = []
         self.file_hash = None
         self.index_ready = False
+        self.document_text = ""
 
     def reset(self):
         logger.info("Resetting engine state")
@@ -44,6 +80,7 @@ class LoChaEngine:
         self.chat = []
         self.file_hash = None
         self.index_ready = False
+        self.document_text = ""
 
     def load_document(self, file_path: str):
         logger.info(f"Loading document: {file_path}")
@@ -65,6 +102,7 @@ class LoChaEngine:
         docs = loader.load()
         for d in docs:
             d.metadata["source"] = os.path.basename(file_path)
+        self.document_text = "\n".join(d.page_content for d in docs)
 
         splitter = RecursiveCharacterTextSplitter(
             chunk_size=800,
@@ -79,18 +117,26 @@ class LoChaEngine:
 
         self.vectorstore = FAISS.from_documents(chunks, embeddings)
 
-        self.memory = ConversationBufferMemory(
+        # Keep only the last few exchanges: the full history is sent with
+        # every follow-up and would otherwise overflow the context window.
+        self.memory = ConversationBufferWindowMemory(
+            k=4,
             memory_key="chat_history",
             return_messages=True,
             output_key="answer"
         )
 
-        llm = Ollama(model="llama3.2:latest", temperature=0.5)
+        # Ollama's default context window is small; 5 excerpts plus the
+        # prompt can overflow it, silently cutting off the instructions.
+        llm = Ollama(model="llama3.2:latest", temperature=0.2, num_ctx=8192)
 
         self.qa_chain = ConversationalRetrievalChain.from_llm(
             llm=llm,
             retriever=self.vectorstore.as_retriever(search_kwargs={"k": 5}),
             memory=self.memory,
+            condense_question_prompt=CONDENSE_PROMPT,
+            combine_docs_chain_kwargs={"prompt": QA_PROMPT},
+            return_generated_question=True,
             return_source_documents=True,
             output_key="answer"
         )
@@ -107,6 +153,14 @@ class LoChaEngine:
 
         answer = result["answer"]
         sources = result.get("source_documents", [])
+        logger.info(f"Searched document for: {result.get('generated_question', question)}")
+        logger.info(
+            "Retrieved excerpts from: "
+            + ", ".join(
+                f"page {d.metadata['page'] + 1}" if "page" in d.metadata else d.metadata.get("source", "?")
+                for d in sources
+            )
+        )
 
         # ---------------- Citations ----------------
         citations = {}
