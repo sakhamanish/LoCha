@@ -12,6 +12,7 @@ The voice dependencies are optional: if they are missing, LoCha still runs
 and the voice controls are disabled.
 """
 
+import re
 import sys
 import logging
 import threading
@@ -152,8 +153,34 @@ class Transcriber:
 
 
 # ---------------- Text-to-speech ----------------
+TTS_CHUNK_CHARS = 200
+
+
+def _split_sentences(text: str, max_chars=TTS_CHUNK_CHARS):
+    """Splits text into sentences, merging short ones up to max_chars."""
+    sentences = [
+        p.strip() for p in re.split(r"(?<=[.!?])\s+|\n+", text) if p.strip()
+    ]
+    chunks = []
+    for sentence in sentences:
+        if chunks and len(chunks[-1]) + 1 + len(sentence) <= max_chars:
+            chunks[-1] += " " + sentence
+        else:
+            chunks.append(sentence)
+    return chunks
+
+
 class Speaker:
-    """Speaks text with the OS voices. speak() blocks; stop() is thread-safe."""
+    """
+    Speaks text with the OS voices. speak() blocks; stop() is thread-safe.
+    Each Speaker is meant for a single utterance.
+
+    Text is spoken in sentence-sized chunks so stop() always takes effect at
+    the next chunk boundary. Where the driver reports words while they
+    are spoken (SAPI5 on Windows, NSSpeechSynthesizer on macOS), stop() also
+    interrupts mid-sentence. The Linux eSpeak driver synthesises a whole
+    chunk before playing it, so there the chunk boundary is the limit.
+    """
 
     def __init__(self):
         self._stop_requested = threading.Event()
@@ -161,10 +188,9 @@ class Speaker:
     def speak(self, text: str):
         if not TTS_AVAILABLE:
             raise RuntimeError(f"Read-aloud is unavailable: {TTS_IMPORT_ERROR}")
-        if not text.strip():
+        chunks = _split_sentences(text)
+        if not chunks:
             return
-
-        self._stop_requested.clear()
 
         # SAPI5 is a COM API; COM must be initialised in this worker thread.
         com_initialised = False
@@ -187,8 +213,11 @@ class Speaker:
                     tts.stop()
 
             tts.connect("started-word", on_word)
-            tts.say(text)
-            tts.runAndWait()
+            for chunk in chunks:
+                if self._stop_requested.is_set():
+                    break
+                tts.say(chunk)
+                tts.runAndWait()
             del tts
         finally:
             if com_initialised:
