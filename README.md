@@ -39,11 +39,11 @@ If the voice packages are not installed, the voice controls are greyed out and t
 
 Summarize:
 After loading a document, click "Summarize" for a brief overview: a short paragraph with the gist of the document, then its key points.
-Long documents are summarized section by section, so this can take a minute or two; the status line shows progress. The summary is kept, so clicking again shows it instantly, and "Save Conversation" includes it.
+The summary appears as it is written. For long documents LoCha picks about ten passages that represent the document's different topics (plus the opening) and summarizes those in one go, so it stays quick. The summary is kept, even after restarting LoCha, so clicking again shows it instantly, and "Save Conversation" includes it.
 
 Source match:
-Each answer shows a "Source match" percentage: how closely the best passage in the document matches your question (cosine similarity).
-With this search model even close matches usually score 55-75%, so a word is shown next to it: strong (55% and up), moderate (35-54%) or weak (below 35%).
+Each answer shows a "Source match" score from 0.00 to 1.00: how closely the best passage in the document matches your question (cosine similarity).
+With this search model even close matches usually score 0.55-0.75, so a word is shown next to it: strong (0.55 and up), moderate (0.35-0.54) or weak (below 0.35).
 A weak match means the document probably doesn't cover the question, so treat the answer with caution.
 
 Troubleshooting:
@@ -51,6 +51,6 @@ If LoCha says "Ollama isn't running", start the Ollama app (or run "ollama serve
 If it says the model isn't downloaded, run: ollama pull llama3.2:latest
 
 Faster answers and reloading:
-Answers appear word by word as they are written, so you can start reading straight away.
+Answers appear as they are written, at a steady reading pace (about the speed of the voice, so the two stay in step), and with read-aloud on the voice starts with the first sentence. To change the pace, set LOCHA_TEXT_SPEED to the characters per second you want (default 22) before starting LoCha.
 The first time you load a document, LoCha indexes it and saves the index on your computer. Loading the same file again (even after restarting LoCha) skips re-indexing and is almost instant; a summary you already made is kept too. A changed file counts as a new document.
 The saved indexes are in %LOCALAPPDATA%\LoCha\index on Windows (~/.cache/LoCha/index on macOS/Linux). They are small, stay on your computer, and can be deleted at any time to free space.

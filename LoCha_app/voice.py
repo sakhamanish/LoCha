@@ -19,6 +19,7 @@ import os
 import re
 import sys
 import json
+import queue
 import struct
 import logging
 import threading
@@ -341,23 +342,61 @@ class _PiperProcess:
         for line in proc.stderr:
             logger.warning(f"Natural voice: {line.decode(errors='replace').rstrip()}")
 
-    def speak(self, text, stop_event):
+    def speak(self, texts, stop_event):
+        """
+        Speaks each text from the iterable in turn through one open audio
+        stream, so sentences that arrive while an answer is still being
+        written play back to back.
+        """
         with self._lock:
             if stop_event.is_set():
                 return
-            self._ensure_started()
-            self._proc.stdin.write((json.dumps({"text": text}) + "\n").encode())
-            self._proc.stdin.flush()
+            self._ensure_started()  # before reading texts: on failure the
+                                    # caller can still speak them all
+            # Texts are sent from a separate thread as soon as they are
+            # available, so Piper synthesizes the next sentence while the
+            # current one plays (no pause between sentences).
+            counts = {"sent": 0, "done": 0}
+            counts_lock = threading.Lock()
+            sender_done = threading.Event()
+
+            def send_texts():
+                try:
+                    for text in texts:
+                        if stop_event.is_set():
+                            break
+                        self._proc.stdin.write((json.dumps({"text": text}) + "\n").encode())
+                        self._proc.stdin.flush()
+                        with counts_lock:
+                            counts["sent"] += 1
+                except Exception as e:  # worker died; the reader sees EOF
+                    logger.warning(f"Natural voice: could not send text: {e}")
+                finally:
+                    sender_done.set()
+
+            threading.Thread(target=send_texts, daemon=True).start()
 
             stream = None
             try:
                 while True:
+                    with counts_lock:
+                        outstanding = counts["sent"] - counts["done"]
+                    if outstanding == 0:
+                        if sender_done.is_set():
+                            with counts_lock:
+                                if counts["sent"] == counts["done"]:
+                                    break
+                            continue
+                        sender_done.wait(0.02)
+                        continue
                     rate, length = struct.unpack("<II", self._read(8))
                     if length == 0 and rate == 0:
-                        break  # end of utterance
+                        with counts_lock:
+                            counts["done"] += 1  # end of one text
+                        continue
                     pcm = self._read(length)
                     if stop_event.is_set():
-                        continue  # drain the rest so the next answer starts clean
+                        continue  # drain so the next request starts clean
                     if stream is None or stream.samplerate != rate:
                         if stream is not None:
                             stream.stop()
@@ -409,6 +448,48 @@ def _split_sentences(text: str, max_chars=TTS_CHUNK_CHARS):
     return chunks
 
 
+class LiveSpeech:
+    """
+    Receives an answer's text while it is being written (feed) and hands
+    complete sentences to the speaker (sentences), so reading aloud starts
+    with the first sentence instead of after the whole answer.
+    feed() and finish() are called from the UI thread; sentences() is
+    consumed by the speaking thread.
+    """
+
+    # A sentence ends at . ! ? followed by whitespace (not after a digit, so
+    # list numbers like "1. " stay with their item), or at a line break.
+    _BOUNDARY = re.compile(r"(?<=[^\d\s][.!?])\s+|\n+")
+
+    def __init__(self):
+        self._pending = ""
+        self._queue = queue.Queue()
+
+    def feed(self, text):
+        self._pending += text
+        parts = self._BOUNDARY.split(self._pending)
+        for sentence in parts[:-1]:
+            if sentence.strip():
+                self._queue.put(sentence)
+        self._pending = parts[-1]
+
+    def finish(self):
+        if self._pending.strip():
+            self._queue.put(self._pending)
+        self._pending = ""
+        self._queue.put(None)
+
+    def sentences(self, stop_event):
+        while not stop_event.is_set():
+            try:
+                sentence = self._queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if sentence is None:
+                return
+            yield sentence
+
+
 class Speaker:
     """
     Speaks text with the natural Piper voice, or the OS voices if Piper is
@@ -429,14 +510,20 @@ class Speaker:
         self._stop_requested = threading.Event()
 
     def speak(self, text: str):
+        """Speaks a complete text."""
+        self._speak_texts(iter([text]))
+
+    def speak_live(self, live: "LiveSpeech"):
+        """Speaks sentences as they arrive until live.finish() is called."""
+        self._speak_texts(live.sentences(self._stop_requested))
+
+    def _speak_texts(self, texts):
         if not READ_ALOUD_AVAILABLE:
             raise RuntimeError(f"Read-aloud is unavailable: {TTS_IMPORT_ERROR}")
-        chunks = _split_sentences(_clean_for_speech(text))
-        if not chunks:
-            return
+        texts = (t for t in map(_clean_for_speech, texts) if t)
         if PIPER_AVAILABLE:
             try:
-                _piper.speak(" ".join(chunks), self._stop_requested)
+                _piper.speak(texts, self._stop_requested)
                 return
             except _PiperUnavailable as e:
                 logger.warning(f"Natural voice unavailable, using system voice: {e}")
@@ -445,6 +532,14 @@ class Speaker:
                 return
             if self._stop_requested.is_set() or not TTS_AVAILABLE:
                 return
+        for text in texts:
+            if self._stop_requested.is_set():
+                break
+            self._speak_system(_split_sentences(text))
+
+    def _speak_system(self, chunks):
+        if not chunks:
+            return
         if sys.platform == "win32":
             self._speak_windows(" ".join(chunks), chunks)
         else:

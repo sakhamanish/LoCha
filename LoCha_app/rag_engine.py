@@ -5,6 +5,7 @@ import logging
 import threading
 import urllib.request
 
+import numpy as np
 from langchain_core.callbacks import BaseCallbackHandler
 
 LLM_MODEL = "llama3.2:latest"
@@ -90,21 +91,12 @@ Follow-up question: {question}
 Standalone question:"""
 )
 
-# Summaries: long documents are summarized in sections ("map"), then the
-# section notes are combined into one brief summary ("reduce").
-SUMMARY_SECTION_CHARS = 6000  # about 1500 tokens per call
-SUMMARY_MAX_SECTIONS = 8      # longer documents are sampled evenly
-
-SUMMARY_PART_PROMPT = PromptTemplate.from_template(
-    """Below is part {index} of {total} of a document.
-List the key points of this part in 2 to 4 short bullet points.
-Use only information from the text. Reply with the bullet points only.
-
-Text:
-{text}
-
-Key points:"""
-)
+# Summaries are written in a single model call (several sequential calls
+# were slow on a CPU). Documents longer than SUMMARY_MAX_CHARS are
+# represented by their opening passage plus the most typical passage of
+# each topic (clusters of passage embeddings), in document order.
+SUMMARY_MAX_CHARS = 9000   # about 2300 tokens
+SUMMARY_TOPICS = 10
 
 SUMMARY_PROMPT = PromptTemplate.from_template(
     """Below are {kind} a document.
@@ -126,15 +118,16 @@ MATCH_MODERATE = 0.35
 
 class _AnswerStreamer(BaseCallbackHandler):
     """Passes the answer's tokens to on_token as the model writes them.
-    The chain also calls the model to rewrite follow-up questions; those
-    calls are recognized by their prompt and not streamed."""
+    Only calls whose prompt starts with prompt_prefix are streamed: the
+    chain also calls the model to rewrite follow-up questions."""
 
-    def __init__(self, on_token):
+    def __init__(self, on_token, prompt_prefix="You are LoCha"):
         self.on_token = on_token
+        self.prompt_prefix = prompt_prefix
         self.active = False
 
     def on_llm_start(self, serialized, prompts, **kwargs):
-        self.active = bool(prompts) and prompts[0].startswith("You are LoCha")
+        self.active = bool(prompts) and prompts[0].startswith(self.prompt_prefix)
 
     def on_llm_new_token(self, token, **kwargs):
         if self.active and token:
@@ -147,7 +140,7 @@ class _AnswerStreamer(BaseCallbackHandler):
 def format_match(qa: dict) -> str:
     if qa.get("match_score") is None:
         return "not available"
-    return f"{qa['match_score']}% ({qa['match']})"
+    return f"{qa['match_score']:.2f} ({qa['match']})"
 
 
 # ---------------- Logging ----------------
@@ -354,7 +347,7 @@ class LoChaEngine:
         # ---------------- Source match ----------------
         # How closely the best passage matches the question that was
         # searched (cosine similarity of the normalized embeddings).
-        match_score, match = self._source_match(searched) if sources else (0, "weak")
+        match_score, match = self._source_match(searched) if sources else (0.0, "weak")
 
         qa = {
             "question": question,
@@ -369,9 +362,9 @@ class LoChaEngine:
 
     def _source_match(self, query: str):
         """
-        Returns (score, label): score is the cosine similarity (0-100%)
+        Returns (score, label): score is the cosine similarity (0.00-1.00)
         between the question and the best-matching passage; label puts it
-        in words, as this model rarely scores even close matches above 75%.
+        in words, as this model rarely scores even close matches above 0.75.
         """
         try:
             scored = self.vectorstore.similarity_search_with_score(query, k=1)
@@ -379,7 +372,7 @@ class LoChaEngine:
             logger.warning(f"Source match estimation failed: {e}")
             return None, "unknown"
         if not scored:
-            return 0, "weak"
+            return 0.0, "weak"
         # For unit vectors, squared L2 distance d = 2 - 2 * cosine.
         cosine = max(0.0, min(1.0, 1 - float(scored[0][1]) / 2))
         logger.info(f"Best passage similarity: {cosine:.2f}")
@@ -389,12 +382,12 @@ class LoChaEngine:
             label = "moderate"
         else:
             label = "weak"
-        return round(cosine * 100), label
+        return round(cosine, 2), label
 
-    def summarize(self, progress=None) -> str:
+    def summarize(self, on_token=None) -> str:
         """
         Returns a brief summary of the loaded document (cached per document).
-        progress(step, total) is called before each model call.
+        on_token(text), if given, receives the summary as it is written.
         """
         if not self.index_ready:
             raise RuntimeError("Document not indexed yet")
@@ -402,39 +395,17 @@ class LoChaEngine:
             return self.summary
         check_ollama()
 
-        sections = RecursiveCharacterTextSplitter(
-            chunk_size=SUMMARY_SECTION_CHARS, chunk_overlap=0
-        ).split_text(self.document_text)
-        if not sections:
-            raise RuntimeError("The document has no readable text to summarize.")
-        if len(sections) > SUMMARY_MAX_SECTIONS:
-            last = len(sections) - 1
-            picks = sorted({
-                round(i * last / (SUMMARY_MAX_SECTIONS - 1))
-                for i in range(SUMMARY_MAX_SECTIONS)
-            })
-            logger.info(f"Summarizing {len(picks)} of {len(sections)} sections")
-            sections = [sections[i] for i in picks]
-
-        report = progress or (lambda step, total: None)
-        if len(sections) == 1:
-            report(1, 1)
-            summary = self.llm.invoke(
-                SUMMARY_PROMPT.format(kind="the contents of", text=sections[0])
-            )
+        if len(self.document_text) <= SUMMARY_MAX_CHARS:
+            kind, text = "the contents of", self.document_text
         else:
-            total = len(sections) + 1
-            notes = []
-            for i, section in enumerate(sections, 1):
-                report(i, total)
-                part = self.llm.invoke(SUMMARY_PART_PROMPT.format(
-                    index=i, total=len(sections), text=section
-                ))
-                notes.append(f"Part {i}:\n{part.strip()}")
-            report(total, total)
-            summary = self.llm.invoke(SUMMARY_PROMPT.format(
-                kind="notes on each part of", text="\n\n".join(notes)
-            ))
+            kind, text = "representative excerpts (in order) from", self._representative_excerpts()
+        if not text.strip():
+            raise RuntimeError("The document has no readable text to summarize.")
+
+        callbacks = [_AnswerStreamer(on_token, prompt_prefix="")] if on_token else []
+        summary = self.llm.invoke(
+            SUMMARY_PROMPT.format(kind=kind, text=text), config={"callbacks": callbacks}
+        )
 
         self.summary = summary.strip()
         logger.info("Summary generated")
@@ -445,6 +416,44 @@ class LoChaEngine:
             except Exception as e:
                 logger.warning(f"Could not cache the summary: {e}")
         return self.summary
+
+    def _representative_excerpts(self) -> str:
+        """The opening passage plus, for each of SUMMARY_TOPICS clusters of
+        passage embeddings, the passage closest to the cluster's center,
+        joined in document order within SUMMARY_MAX_CHARS."""
+        store = self.vectorstore
+        n = store.index.ntotal
+        vectors = store.index.reconstruct_n(0, n)
+        k = min(SUMMARY_TOPICS, n)
+
+        # k-means (cosine), started from passages spread evenly through the
+        # document so the result is deterministic.
+        centers = vectors[np.linspace(0, n - 1, k).round().astype(int)]
+        for _ in range(20):
+            labels = np.argmax(vectors @ centers.T, axis=1)
+            for c in range(k):
+                members = vectors[labels == c]
+                if len(members):
+                    center = members.mean(axis=0)
+                    centers[c] = center / (np.linalg.norm(center) or 1)
+        labels = np.argmax(vectors @ centers.T, axis=1)
+
+        picks = {0}  # the opening usually holds the title and introduction
+        for c in range(k):
+            members = np.where(labels == c)[0]
+            if len(members):
+                picks.add(int(members[np.argmax(vectors[members] @ centers[c])]))
+
+        excerpts, total = [], 0
+        for i in sorted(picks):
+            doc = store.docstore.search(store.index_to_docstore_id[i])
+            text = doc.page_content.strip()
+            if total + len(text) > SUMMARY_MAX_CHARS:
+                break
+            excerpts.append(text)
+            total += len(text)
+        logger.info(f"Summarizing {len(excerpts)} representative passages of {n}")
+        return "\n...\n".join(excerpts)
 
     def save_conversation(self, path: str):
         logger.info(f"Saving conversation to {path}")

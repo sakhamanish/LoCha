@@ -124,25 +124,32 @@ class AskQuestionWorker(QObject):
 class SummarizeWorker(QObject):
     finished = Signal()
     status_update = Signal(str)
+    writing_started = Signal()  # a new summary is being written
+    token = Signal(str)         # summary text as the model writes it
     result_ready = Signal(str)
     error = Signal(str)
 
     def run(self):
         try:
-            self.result_ready.emit(engine.summarize(progress=self.report))
+            if not engine.summary:  # cached summaries appear instantly
+                self.status_update.emit(
+                    "<b style='font-size:16px; color:#2E7D32;'>Summarizing the document…</b>"
+                )
+                self.writing_started.emit()
+            self.result_ready.emit(engine.summarize(on_token=self.token.emit))
         except Exception as e:
             self.error.emit(str(e))
         finally:
             self.finished.emit()
 
-    def report(self, step, total):
-        if total == 1:
-            msg = "Summarizing the document…"
-        elif step < total:
-            msg = f"Summarizing the document… part {step} of {total - 1}"
-        else:
-            msg = "Summarizing the document… writing the summary"
-        self.status_update.emit(f"<b style='font-size:16px; color:#2E7D32;'>{msg}</b>")
+
+# Streamed text is shown at a steady reading pace instead of as fast as the
+# model writes it; this is also about the voice's speaking rate, so with
+# read-aloud on the text and voice stay roughly in step. Characters/second.
+TEXT_SPEED = float(os.environ.get("LOCHA_TEXT_SPEED", "22"))
+REVEAL_INTERVAL_MS = 40
+
+SUMMARY_HEADER = '<span style="font-size:16px; font-weight:bold;">Document summary</span><br>'
 
 
 class TranscribeWorker(QObject):
@@ -168,13 +175,17 @@ class SpeakWorker(QObject):
     error = Signal(str)
 
     def __init__(self, text):
+        """text: a string, or a voice.LiveSpeech still receiving the answer."""
         super().__init__()
         self.text = text
         self.speaker = voice.Speaker()
 
     def run(self):
         try:
-            self.speaker.speak(self.text)
+            if isinstance(self.text, voice.LiveSpeech):
+                self.speaker.speak_live(self.text)
+            else:
+                self.speaker.speak(self.text)
         except Exception as e:
             self.error.emit(str(e))
         finally:
@@ -355,6 +366,15 @@ class LoChaApp(QWidget):
         self.asking = False  # loading, answering or summarizing
         self.live_cursor = None  # answer being streamed, if any
         self.live_has_text = False
+        self.live_speech = None  # sentences being read aloud as they arrive
+        self.live_status = ""
+        self.live_result_received = False
+        self.reveal_buffer = ""  # streamed text not yet shown
+        self.reveal_credit = 0.0
+        self.after_reveal = []
+        self.reveal_timer = QTimer(self)
+        self.reveal_timer.setInterval(REVEAL_INTERVAL_MS)
+        self.reveal_timer.timeout.connect(self.reveal_tick)
 
         QTimer.singleShot(0, self.check_ollama_on_start)
 
@@ -433,25 +453,39 @@ class LoChaApp(QWidget):
 
     # ---------- Streaming answer ----------
     def start_live_answer(self, question_html):
-        """Shows the question and an empty answer at the top; tokens are
-        appended as plain text until the formatted answer replaces it."""
+        self.start_live(
+            question_html
+            + '<br><span style="font-size:16px; font-weight:bold;">Answer:</span><br>'
+        )
+
+    def start_live_summary(self):
+        self.start_live(SUMMARY_HEADER, "Writing the summary…")
+
+    def start_live(self, header_html, writing_status="Writing the answer…"):
+        """Shows the header and an empty text at the top; tokens are
+        appended as plain text until the formatted result replaces it.
+        With read-aloud on, sentences are spoken as soon as they're complete."""
         cursor = QTextCursor(self.answer_box.document())
         cursor.movePosition(QTextCursor.Start)
         # Two empty blocks keep the live answer apart from older answers.
         cursor.insertBlock()
         cursor.insertBlock()
         cursor.movePosition(QTextCursor.Start)
-        cursor.insertHtml(
-            question_html
-            + '<br><span style="font-size:16px; font-weight:bold;">Answer:</span><br>'
-        )
+        cursor.insertHtml(header_html)
         fmt = QTextCharFormat()
         fmt.setFontPointSize(12)
         fmt.setFontWeight(QFont.Normal)
         cursor.setCharFormat(fmt)
         self.live_cursor = cursor
         self.live_has_text = False
+        self.live_status = writing_status
+        self.live_result_received = False
+        self.reveal_buffer = ""
+        self.reveal_credit = 0.0
         self.answer_box.moveCursor(QTextCursor.Start)
+        if self.read_aloud_cb.isChecked() and voice.READ_ALOUD_AVAILABLE:
+            self.live_speech = voice.LiveSpeech()
+            self.speak(self.live_speech)
 
     def append_live_answer(self, token):
         if self.live_cursor is None:
@@ -459,9 +493,47 @@ class LoChaApp(QWidget):
         if not self.live_has_text:
             self.live_has_text = True
             self.status.setText(
-                "<b style='font-size:16px; color:#2E7D32;'>Writing the answer…</b>"
+                f"<b style='font-size:16px; color:#2E7D32;'>{self.live_status}</b>"
             )
-        self.live_cursor.insertText(token)
+        # The voice gets text as soon as it's written; the screen shows it
+        # at TEXT_SPEED (see reveal_tick).
+        self.reveal_buffer += token
+        if not self.reveal_timer.isActive():
+            self.reveal_timer.start()
+        if self.live_speech is not None:
+            self.live_speech.feed(token)
+
+    def reveal_tick(self):
+        if self.live_cursor is not None and self.reveal_buffer:
+            self.reveal_credit += TEXT_SPEED * REVEAL_INTERVAL_MS / 1000
+            count = int(self.reveal_credit)
+            if count:
+                self.reveal_credit -= count
+                self.live_cursor.insertText(self.reveal_buffer[:count])
+                self.reveal_buffer = self.reveal_buffer[count:]
+        if not self.reveal_buffer:
+            self.reveal_timer.stop()
+            callbacks, self.after_reveal = self.after_reveal, []
+            for callback in callbacks:
+                callback()
+
+    def when_revealed(self, callback):
+        """Runs callback once all streamed text is on screen."""
+        if self.reveal_buffer:
+            self.after_reveal.append(callback)
+        else:
+            callback()
+
+    def finish_live_speech(self, full_text):
+        """Speaks the rest once the text is complete (or all of it, if
+        nothing was streamed). Returns False if live speech wasn't used."""
+        if self.live_speech is None:
+            return False
+        if not self.live_has_text:
+            self.live_speech.feed(full_text)
+        self.live_speech.finish()
+        self.live_speech = None
+        return True
 
     def remove_live_answer(self):
         if self.live_cursor is None:
@@ -475,6 +547,13 @@ class LoChaApp(QWidget):
         self.live_cursor = None
 
     def display_answer(self, q_html, a_html):
+        self.live_result_received = True
+        answer = engine.chat[0]["answer"] if engine.chat else ""
+        if not self.finish_live_speech(answer) and self.read_aloud_cb.isChecked() and answer:
+            self.speak(answer)
+        self.when_revealed(lambda: self.show_answer(q_html, a_html))
+
+    def show_answer(self, q_html, a_html):
         self.remove_live_answer()
         self.answer_box.moveCursor(QTextCursor.Start)
         self.answer_box.insertHtml(q_html + a_html + "<hr>")
@@ -482,8 +561,6 @@ class LoChaApp(QWidget):
         self.status.setText(
             "<b style='font-size:16px; color:#2E7D32;'>Ready for another question.</b>"
         )
-        if self.read_aloud_cb.isChecked() and engine.chat:
-            self.speak(engine.chat[0]["answer"])
 
     def summarize_document(self):
         if not engine.index_ready:
@@ -500,6 +577,8 @@ class LoChaApp(QWidget):
 
         self.summary_thread.started.connect(self.summary_worker.run)
         self.summary_worker.status_update.connect(self.update_status)
+        self.summary_worker.writing_started.connect(self.start_live_summary)
+        self.summary_worker.token.connect(self.append_live_answer)
         self.summary_worker.result_ready.connect(self.display_summary)
         self.summary_worker.error.connect(self.show_error)
         self.summary_worker.finished.connect(self.on_summary_finished)
@@ -510,6 +589,12 @@ class LoChaApp(QWidget):
         self.summary_thread.start()
 
     def display_summary(self, summary):
+        self.live_result_received = True
+        if not self.finish_live_speech(summary) and self.read_aloud_cb.isChecked():
+            self.speak(summary)
+        self.when_revealed(lambda: self.show_summary(summary))
+
+    def show_summary(self, summary):
         lines = []
         for line in summary.splitlines():
             line = line.strip()
@@ -519,25 +604,40 @@ class LoChaApp(QWidget):
             line = text_to_html(line[2:] if bullet else line)
             lines.append(f"• {line}" if bullet else line)
         summary_html = (
-            '<span style="font-size:16px; font-weight:bold;">Document summary</span><br>'
-            '<div style="background-color:#e8f0fe; padding:8px;">'
+            SUMMARY_HEADER
+            + '<div style="background-color:#e8f0fe; padding:8px;">'
             f'<p style="font-size:16px;">{"<br>".join(lines)}</p>'
             '</div>'
         )
+        self.remove_live_answer()
         self.answer_box.moveCursor(QTextCursor.Start)
         self.answer_box.insertHtml(summary_html + "<hr>")
         self.status.setText(
             "<b style='font-size:16px; color:#2E7D32;'>Summary ready. Ask a question for details.</b>"
         )
-        if self.read_aloud_cb.isChecked():
-            self.speak(summary)
 
     def on_summary_finished(self):
-        self.set_busy(False)
+        self.abort_live()
+        self.when_revealed(lambda: self.set_busy(False))
+
+    def abort_live(self):
+        """A live text or live speech left over when its worker finishes
+        without a result means it failed: remove the partial text and stop
+        speaking."""
+        if self.live_result_received:
+            return
+        self.reveal_buffer = ""
+        self.after_reveal = []
+        self.reveal_timer.stop()
+        if self.live_speech is not None:
+            self.live_speech.finish()
+            self.live_speech = None
+            self.stop_speaking()
+        self.remove_live_answer()
 
     def on_ask_finished(self):
-        self.remove_live_answer()  # left over only if answering failed
-        self.set_busy(False)
+        self.abort_live()
+        self.when_revealed(lambda: self.set_busy(False))
 
     # ---------------- Voice ----------------
     def update_mic_state(self):
