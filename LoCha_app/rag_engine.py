@@ -1,14 +1,35 @@
 import os
+import json
 import hashlib
 import logging
+import urllib.request
 
-import subprocess
+LLM_MODEL = "llama3.2:latest"
+OLLAMA_URL = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+if not OLLAMA_URL.startswith("http"):
+    OLLAMA_URL = "http://" + OLLAMA_URL
 
-def check_ollama():
+
+def check_ollama(model=LLM_MODEL):
+    """
+    Raises RuntimeError with a plain-language fix if the Ollama server is
+    not running or the model has not been downloaded.
+    """
     try:
-        subprocess.run(["ollama", "list"], check=True)
+        with urllib.request.urlopen(f"{OLLAMA_URL}/api/tags", timeout=3) as r:
+            installed = [m.get("name", "") for m in json.load(r).get("models", [])]
     except Exception:
-        raise RuntimeError("Ollama not installed. Please install Ollama.")
+        raise RuntimeError(
+            "Ollama isn't running.\n\nStart the Ollama app (or run 'ollama serve' "
+            "in a terminal), then try again. If Ollama isn't installed, get it "
+            "from https://ollama.com"
+        )
+    base = model.split(":")[0]
+    if model not in installed and not (model.endswith(":latest") and base in installed):
+        raise RuntimeError(
+            f"The language model '{model}' isn't downloaded yet.\n\n"
+            f"Run this in a terminal, then try again:\n  ollama pull {model}"
+        )
 
 
 from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader
@@ -82,6 +103,18 @@ Do not add a title.
 Summary:"""
 )
 
+# Source match: cosine similarity thresholds for all-MiniLM-L6-v2, where
+# closely related passages typically score above ~0.55 and unrelated
+# ones below ~0.3.
+MATCH_STRONG = 0.55
+MATCH_MODERATE = 0.35
+
+def format_match(qa: dict) -> str:
+    if qa.get("match_score") is None:
+        return "not available"
+    return f"{qa['match_score']}% ({qa['match']})"
+
+
 # ---------------- Logging ----------------
 logging.basicConfig(
     level=logging.INFO,
@@ -143,8 +176,11 @@ class LoChaEngine:
         chunks = splitter.split_documents(docs)
         logger.info(f"Document split into {len(chunks)} chunks")
 
+        # Normalized vectors make FAISS's squared L2 distance map directly
+        # to cosine similarity (used for the source-match indicator).
         embeddings = HuggingFaceEmbeddings(
-            model_name="sentence-transformers/all-MiniLM-L6-v2"
+            model_name="sentence-transformers/all-MiniLM-L6-v2",
+            encode_kwargs={"normalize_embeddings": True},
         )
 
         self.vectorstore = FAISS.from_documents(chunks, embeddings)
@@ -160,7 +196,7 @@ class LoChaEngine:
 
         # Ollama's default context window is small; 5 excerpts plus the
         # prompt can overflow it, silently cutting off the instructions.
-        llm = Ollama(model="llama3.2:latest", temperature=0.2, num_ctx=8192)
+        llm = Ollama(model=LLM_MODEL, temperature=0.2, num_ctx=8192)
         self.llm = llm
 
         self.qa_chain = ConversationalRetrievalChain.from_llm(
@@ -182,11 +218,13 @@ class LoChaEngine:
             raise RuntimeError("Document not indexed yet")
 
         logger.info(f"Question received: {question}")
+        check_ollama()
         result = self.qa_chain.invoke({"question": question})
 
         answer = result["answer"]
         sources = result.get("source_documents", [])
-        logger.info(f"Searched document for: {result.get('generated_question', question)}")
+        searched = result.get("generated_question") or question
+        logger.info(f"Searched document for: {searched}")
         logger.info(
             "Retrieved excerpts from: "
             + ", ".join(
@@ -218,47 +256,45 @@ class LoChaEngine:
             for src, pages in citations.items()
         )
 
-        # ---------------- Confidence (retrieval-score based) ----------------
-        confidence = 50  # default fallback
-
-        if sources:
-            try:
-                # Re-run retrieval to get similarity scores (FAISS returns distance; lower = better)
-                scored_docs = self.vectorstore.similarity_search_with_score(question, k=5)
-
-                distances = [score for _, score in scored_docs]
-
-                if distances:
-                    # Convert FAISS distance to similarity proxy in [0, 1]
-                    similarities = [max(0.0, min(1.0, 1 - (d / 50)))  # 50 is a practical upper bound
-                                    for d in distances
-            ]
-
-                    max_sim = max(similarities)
-                    avg_sim = sum(similarities) / len(similarities)
-
-                    # Core confidence calculation
-                    confidence = round(
-                        100 * (0.6 * max_sim + 0.4 * avg_sim),
-                        1
-                    )
-
-                    # Clamp to realistic RAG bounds
-                    confidence = int(max(45, min(confidence, 95)))
-            except Exception as e:
-                logger.warning(f"Confidence estimation failed, using fallback: {e}")
-                confidence = 55
-
+        # ---------------- Source match ----------------
+        # How closely the best passage matches the question that was
+        # searched (cosine similarity of the normalized embeddings).
+        match_score, match = self._source_match(searched) if sources else (0, "weak")
 
         qa = {
             "question": question,
             "answer": answer,
             "citations": citation_text,
-            "confidence": confidence
+            "match": match,
+            "match_score": match_score,
         }
 
         self.chat.insert(0, qa)
         return qa
+
+    def _source_match(self, query: str):
+        """
+        Returns (score, label): score is the cosine similarity (0-100%)
+        between the question and the best-matching passage; label puts it
+        in words, as this model rarely scores even close matches above 75%.
+        """
+        try:
+            scored = self.vectorstore.similarity_search_with_score(query, k=1)
+        except Exception as e:
+            logger.warning(f"Source match estimation failed: {e}")
+            return None, "unknown"
+        if not scored:
+            return 0, "weak"
+        # For unit vectors, squared L2 distance d = 2 - 2 * cosine.
+        cosine = max(0.0, min(1.0, 1 - float(scored[0][1]) / 2))
+        logger.info(f"Best passage similarity: {cosine:.2f}")
+        if cosine >= MATCH_STRONG:
+            label = "strong"
+        elif cosine >= MATCH_MODERATE:
+            label = "moderate"
+        else:
+            label = "weak"
+        return round(cosine * 100), label
 
     def summarize(self, progress=None) -> str:
         """
@@ -269,6 +305,7 @@ class LoChaEngine:
             raise RuntimeError("Document not indexed yet")
         if self.summary:
             return self.summary
+        check_ollama()
 
         sections = RecursiveCharacterTextSplitter(
             chunk_size=SUMMARY_SECTION_CHARS, chunk_overlap=0
@@ -317,7 +354,7 @@ class LoChaEngine:
             text += f"Question {i}: {qa['question']}\n"
             text += f"Answer: {qa['answer']}\n"
             text += f"References: {qa['citations']}\n"
-            text += f"Confidence: {qa['confidence']}%\n"
+            text += f"Source match: {format_match(qa)}\n"
             text += "-" * 50 + "\n\n"
 
         with open(path, "w", encoding="utf-8") as f:

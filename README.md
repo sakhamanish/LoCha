@@ -40,3 +40,12 @@ If the voice packages are not installed, the voice controls are greyed out and t
 Summarize:
 After loading a document, click "Summarize" for a brief overview: a short paragraph with the gist of the document, then its key points.
 Long documents are summarized section by section, so this can take a minute or two; the status line shows progress. The summary is kept, so clicking again shows it instantly, and "Save Conversation" includes it.
+
+Source match:
+Each answer shows a "Source match" percentage: how closely the best passage in the document matches your question (cosine similarity).
+With this search model even close matches usually score 55-75%, so a word is shown next to it: strong (55% and up), moderate (35-54%) or weak (below 35%).
+A weak match means the document probably doesn't cover the question, so treat the answer with caution.
+
+Troubleshooting:
+If LoCha says "Ollama isn't running", start the Ollama app (or run "ollama serve"), then ask again.
+If it says the model isn't downloaded, run: ollama pull llama3.2:latest

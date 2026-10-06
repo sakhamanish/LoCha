@@ -1,8 +1,9 @@
 import sys
 import os
+import re
 import html
 from PySide6.QtGui import QIcon, QTextCursor, QPixmap
-from PySide6.QtCore import Qt, Signal, QObject, QThread
+from PySide6.QtCore import Qt, Signal, QObject, QThread, QTimer
 
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QPushButton,
@@ -10,7 +11,7 @@ from PySide6.QtWidgets import (
     QCheckBox
 )
 
-from LoCha_app.rag_engine import LoChaEngine
+from LoCha_app.rag_engine import LoChaEngine, check_ollama, format_match
 from LoCha_app import voice
 
 # -------------------------------------------------
@@ -34,6 +35,16 @@ if not os.path.exists(ICON_PATH):
 engine = LoChaEngine()
 recorder = voice.VoiceRecorder()
 transcriber = voice.Transcriber()
+
+def text_to_html(text):
+    """Escapes model/user text for the rich-text answer box, keeping line
+    breaks and **bold** (otherwise "a < b" vanishes and lists run together)."""
+    escaped = html.escape(text or "").strip()
+    escaped = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", escaped)
+    return escaped.replace("\n", "<br>")
+
+
+MATCH_COLORS = {"strong": "#2E7D32", "moderate": "#E65100", "weak": "#C62828"}
 
 # ---------------- Worker Classes ----------------
 class LoadDocumentWorker(QObject):
@@ -84,15 +95,19 @@ class AskQuestionWorker(QObject):
 
             question_html = (
                 f'<span style="font-size:16px; font-weight:bold;">'
-                f'Question: {qa["question"]}</span><br>'
+                f'Question: {text_to_html(qa["question"])}</span><br>'
             )
 
+            match_color = MATCH_COLORS.get(qa["match"], "#555")
             answer_html = (
                 f'<div style="background-color:#f2f2f2; padding:8px;">'
-                f'<p style="font-size:16px;"><b>Answer:</b> {qa["answer"]}</p>'
+                f'<p style="font-size:16px;"><b>Answer:</b><br>{text_to_html(qa["answer"])}</p>'
                 f'<p style="background-color:#b6f2a1; padding:4px;">'
-                f'<b>References:</b> {qa["citations"] or "Not available"}</p>'
-                f'<p><b>Confidence:</b> {qa["confidence"]}%</p>'
+                f'<b>References:</b> {text_to_html(qa["citations"]) or "Not available"}</p>'
+                f'<p><b>Source match:</b> '
+                f'<span style="color:{match_color};">{format_match(qa)}</span>'
+                f'<span style="color:#777;"> (how closely the best passage '
+                f'matches your question)</span></p>'
                 f'</div>'
             )
 
@@ -328,14 +343,35 @@ class LoChaApp(QWidget):
         self.voice_worker = None
         self.tts_worker = None
         self.tts_jobs = []  # keeps (thread, worker) alive until speech ends
-        self.asking = False
+        self.asking = False  # loading, answering or summarizing
+
+        QTimer.singleShot(0, self.check_ollama_on_start)
+
+    def check_ollama_on_start(self):
+        try:
+            check_ollama()
+        except RuntimeError as e:
+            first_line = html.escape(str(e).split("\n")[0])
+            self.status.setText(
+                f"<b style='font-size:16px; color:#C62828;'>{first_line}</b> "
+                "<span style='font-size:14px; color:#555;'>Questions and summaries "
+                "need it; you can still load a document.</span>"
+            )
+
+    def set_busy(self, busy):
+        """Only one load/answer/summary at a time: starting another while a
+        worker thread runs would destroy that running thread and crash."""
+        self.asking = busy
+        for btn in (self.load_btn, self.summarize_btn, self.ask_btn):
+            btn.setEnabled(not busy)
+        self.update_mic_state()
 
     # ---------------- Logic ----------------
     def load_document(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "Open Document", "", "Documents (*.pdf *.docx)"
         )
-        if not path:
+        if not path or self.asking:
             return
 
         self.answer_box.clear()
@@ -345,9 +381,12 @@ class LoChaApp(QWidget):
         self.worker = LoadDocumentWorker(path)
         self.worker.moveToThread(self.thread)
 
+        self.set_busy(True)
+
         self.thread.started.connect(self.worker.run)
         self.worker.status_update.connect(self.update_status)
         self.worker.error.connect(self.show_error)
+        self.worker.finished.connect(lambda: self.set_busy(False))
         self.worker.finished.connect(self.thread.quit)
         self.worker.finished.connect(self.worker.deleteLater)
         self.thread.finished.connect(self.thread.deleteLater)
@@ -366,8 +405,7 @@ class LoChaApp(QWidget):
         self.worker = AskQuestionWorker(question)
         self.worker.moveToThread(self.thread)
 
-        self.asking = True
-        self.update_mic_state()
+        self.set_busy(True)
 
         self.thread.started.connect(self.worker.run)
         self.worker.status_update.connect(self.update_status)
@@ -397,9 +435,7 @@ class LoChaApp(QWidget):
         if self.asking:
             return
 
-        self.asking = True
-        self.summarize_btn.setEnabled(False)
-        self.update_mic_state()
+        self.set_busy(True)
 
         self.summary_thread = QThread()
         self.summary_worker = SummarizeWorker()
@@ -423,8 +459,7 @@ class LoChaApp(QWidget):
             if not line:
                 continue
             bullet = line[:2] in ("- ", "* ", "• ")
-            line = html.escape(line[2:] if bullet else line)
-            line = line.replace("**", "")
+            line = text_to_html(line[2:] if bullet else line)
             lines.append(f"• {line}" if bullet else line)
         summary_html = (
             '<span style="font-size:16px; font-weight:bold;">Document summary</span><br>'
@@ -441,13 +476,10 @@ class LoChaApp(QWidget):
             self.speak(summary)
 
     def on_summary_finished(self):
-        self.asking = False
-        self.summarize_btn.setEnabled(True)
-        self.update_mic_state()
+        self.set_busy(False)
 
     def on_ask_finished(self):
-        self.asking = False
-        self.update_mic_state()
+        self.set_busy(False)
 
     # ---------------- Voice ----------------
     def update_mic_state(self):
@@ -459,7 +491,7 @@ class LoChaApp(QWidget):
             return
         if self.asking:
             self.mic_btn.setEnabled(False)
-            self.mic_btn.setToolTip("Wait for the answer")
+            self.mic_btn.setToolTip("Please wait until LoCha has finished")
         elif self.tts_worker is not None:
             self.mic_btn.setEnabled(False)
             self.mic_btn.setToolTip("Wait for the answer to finish, or press Stop speaking")
