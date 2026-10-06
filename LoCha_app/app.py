@@ -782,7 +782,7 @@ class LoChaApp(QWidget):
 
 
 # ---------------- Entry ----------------
-if __name__ == "__main__":
+def main():
     # Load the embedding model while the window opens, so the first
     # document (especially a cached one) loads quickly.
     threading.Thread(target=engine.warm_up, daemon=True).start()
@@ -790,3 +790,7 @@ if __name__ == "__main__":
     window = LoChaApp()
     window.show()
     sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()

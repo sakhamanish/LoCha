@@ -12,20 +12,45 @@ Protocol (stdin/stdout):
   then an end frame with both values 0.
 """
 
+import io
+import os
 import json
 import struct
 import sys
 
 
-def main():
+def _std_stream(stream, fd, mode, win_handle):
+    """Binary stdin/stdout. In LoCha.exe (a windowed app) sys.stdin and
+    sys.stdout can be None even though LoCha passed pipes, so fall back to
+    the process's standard handles."""
+    if stream is not None:
+        return stream.buffer
+    try:
+        return os.fdopen(fd, mode)
+    except OSError:
+        import ctypes
+        import msvcrt
+        handle = ctypes.windll.kernel32.GetStdHandle(win_handle)
+        return os.fdopen(msvcrt.open_osfhandle(handle, 0), mode)
+
+
+def main(model_path=None):
     from piper import PiperVoice
 
-    voice = PiperVoice.load(sys.argv[1])
-    out = sys.stdout.buffer
+    if sys.stderr is None:  # windowed exe: keep error messages for LoCha's log
+        try:
+            sys.stderr = io.TextIOWrapper(
+                _std_stream(None, 2, "wb", -12), encoding="utf-8", line_buffering=True
+            )
+        except Exception:
+            sys.stderr = io.StringIO()
+    voice = PiperVoice.load(model_path or sys.argv[1])
+    out = _std_stream(sys.stdout, 1, "wb", -11)  # STD_OUTPUT_HANDLE
+    inp = io.TextIOWrapper(_std_stream(sys.stdin, 0, "rb", -10), encoding="utf-8")
     out.write(b"RDY0")
     out.flush()
 
-    for line in sys.stdin:
+    for line in inp:
         line = line.strip()
         if not line:
             continue

@@ -239,7 +239,7 @@ class LoChaEngine:
 
         # Ollama's default context window is small; 5 excerpts plus the
         # prompt can overflow it, silently cutting off the instructions.
-        llm = Ollama(model=LLM_MODEL, temperature=0.2, num_ctx=8192)
+        llm = Ollama(model=LLM_MODEL, base_url=OLLAMA_URL, temperature=0.2, num_ctx=8192)
         self.llm = llm
 
         self.qa_chain = ConversationalRetrievalChain.from_llm(
