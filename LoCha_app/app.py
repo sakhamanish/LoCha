@@ -108,9 +108,7 @@ class AskQuestionWorker(QObject):
                 f'<p style="background-color:#b6f2a1; padding:4px;">'
                 f'<b>References:</b> {text_to_html(qa["citations"]) or "Not available"}</p>'
                 f'<p><b>Source match:</b> '
-                f'<span style="color:{match_color};">{format_match(qa)}</span>'
-                f'<span style="color:#777;"> (how closely the best passage '
-                f'matches your question)</span></p>'
+                f'<span style="color:{match_color};">{format_match(qa)}</span></p>'
                 f'</div>'
             )
 
