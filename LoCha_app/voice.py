@@ -3,12 +3,14 @@ Offline voice support for LoCha.
 
 - Speech-to-text: microphone capture via `sounddevice`, transcription via
   `faster-whisper` running locally on the CPU.
-- Text-to-speech: the voices installed in the OS. On Windows SAPI is driven
-  directly through `comtypes` (so speech can be stopped instantly);
-  elsewhere `pyttsx3` is used (NSSpeechSynthesizer on macOS, eSpeak on Linux).
+- Text-to-speech: a natural-sounding neural voice (Piper), run in a separate
+  process. If Piper is unavailable, the voices installed in the OS are used:
+  SAPI on Windows (driven through `comtypes`), otherwise `pyttsx3`
+  (NSSpeechSynthesizer on macOS, eSpeak on Linux).
 
-Everything runs on the local machine. The Whisper model is downloaded once
-from Hugging Face on first use and cached, exactly like the embedding model.
+Everything runs on the local machine. The Whisper model and the Piper voice
+are downloaded once from Hugging Face on first use and cached, exactly like
+the embedding model.
 The voice dependencies are optional: if they are missing, LoCha still runs
 and the voice controls are disabled.
 """
@@ -16,8 +18,13 @@ and the voice controls are disabled.
 import os
 import re
 import sys
+import json
+import queue
+import struct
 import logging
 import threading
+import subprocess
+import importlib.util
 from collections import Counter
 
 import numpy as np
@@ -30,12 +37,24 @@ WHISPER_MODEL = os.environ.get("LOCHA_WHISPER_MODEL", "small.en")
 TARGET_SAMPLE_RATE = 16000  # Whisper expects 16 kHz mono audio
 MAX_RECORD_SECONDS = 60
 
+# Natural voice: a Piper voice name from https://huggingface.co/rhasspy/piper-voices
+# (e.g. en_US-amy-medium, en_GB-alba-medium) or a path to a local .onnx voice.
+PIPER_VOICE = os.environ.get("LOCHA_PIPER_VOICE", "en_US-lessac-medium")
+
 try:
     import sounddevice as sd
+    SD_IMPORT_ERROR = ""
+except Exception as e:  # ImportError, or OSError when PortAudio is missing
+    sd = None
+    SD_IMPORT_ERROR = str(e)
+
+try:
+    if sd is None:
+        raise ImportError(SD_IMPORT_ERROR)
     from faster_whisper import WhisperModel
     STT_AVAILABLE = True
     STT_IMPORT_ERROR = ""
-except Exception as e:  # ImportError, or OSError when PortAudio is missing
+except Exception as e:
     STT_AVAILABLE = False
     STT_IMPORT_ERROR = str(e)
 
@@ -46,6 +65,14 @@ try:
 except Exception as e:
     TTS_AVAILABLE = False
     TTS_IMPORT_ERROR = str(e)
+
+# Piper runs as "python tts_worker.py", which a PyInstaller build can't do.
+PIPER_AVAILABLE = (
+    sd is not None
+    and not getattr(sys, "frozen", False)
+    and importlib.util.find_spec("piper") is not None
+)
+READ_ALOUD_AVAILABLE = PIPER_AVAILABLE or TTS_AVAILABLE
 
 
 # ---------------- Speech-to-text ----------------
@@ -228,6 +255,185 @@ class Transcriber:
 TTS_CHUNK_CHARS = 200
 
 
+def _clean_for_speech(text: str) -> str:
+    """Removes markdown symbols that voices would otherwise read out."""
+    text = re.sub(r"[*_`#>]+", "", text or "")
+    text = re.sub(r"^\s*(?:[-•]|\d+[.)])\s+", "", text, flags=re.MULTILINE)
+    return re.sub(r"[ \t]+", " ", text).strip()
+
+
+class _PiperUnavailable(Exception):
+    """The natural voice could not be started; use the system voice."""
+
+
+class _PiperProcess:
+    """
+    Runs tts_worker.py in a separate process (see that file for why) and
+    plays the audio it streams back. Started on first use and kept running,
+    so only the first answer pays the start-up cost.
+    """
+
+    def __init__(self):
+        self._proc = None
+        self._failed = None  # reason, once starting has failed this session
+        self._lock = threading.Lock()  # one utterance at a time
+
+    def _voice_path(self):
+        if PIPER_VOICE.endswith(".onnx"):
+            if not os.path.exists(PIPER_VOICE):
+                raise _PiperUnavailable(f"voice file not found: {PIPER_VOICE}")
+            return PIPER_VOICE
+        try:
+            lang_code, name, quality = PIPER_VOICE.split("-")
+        except ValueError:
+            raise _PiperUnavailable(f"invalid voice name: {PIPER_VOICE}")
+        from huggingface_hub import hf_hub_download
+
+        base = f"{lang_code.split('_')[0]}/{lang_code}/{name}/{quality}/{PIPER_VOICE}"
+        logger.info(f"Loading natural voice '{PIPER_VOICE}' (downloaded once, about 60 MB)")
+        try:
+            model = hf_hub_download("rhasspy/piper-voices", base + ".onnx")
+            hf_hub_download("rhasspy/piper-voices", base + ".onnx.json")
+        except Exception as e:
+            raise _PiperUnavailable(f"could not download voice: {e}")
+        return model
+
+    def _read(self, n):
+        data = b""
+        while len(data) < n:
+            part = self._proc.stdout.read(n - len(data))
+            if not part:
+                raise EOFError("natural voice process ended unexpectedly")
+            data += part
+        return data
+
+    def _ensure_started(self):
+        if self._proc is not None and self._proc.poll() is None:
+            return
+        if self._failed:
+            raise _PiperUnavailable(self._failed)
+        try:
+            self._start()
+        except _PiperUnavailable as e:
+            self._failed = str(e)  # don't retry (and delay) every answer
+            raise
+
+    def _start(self):
+        worker = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tts_worker.py")
+        self._proc = subprocess.Popen(
+            [sys.executable, worker, self._voice_path()],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        threading.Thread(target=self._log_errors, args=(self._proc,), daemon=True).start()
+        try:
+            ready = self._read(4)
+        except EOFError:
+            ready = b""
+        if ready != b"RDY0":
+            self._proc.kill()
+            self._proc = None
+            raise _PiperUnavailable("natural voice failed to start (see log)")
+
+    @staticmethod
+    def _log_errors(proc):
+        for line in proc.stderr:
+            logger.warning(f"Natural voice: {line.decode(errors='replace').rstrip()}")
+
+    def speak(self, texts, stop_event):
+        """
+        Speaks each text from the iterable in turn through one open audio
+        stream, so sentences that arrive while an answer is still being
+        written play back to back.
+        """
+        with self._lock:
+            if stop_event.is_set():
+                return
+            self._ensure_started()  # before reading texts: on failure the
+                                    # caller can still speak them all
+            # Texts are sent from a separate thread as soon as they are
+            # available, so Piper synthesizes the next sentence while the
+            # current one plays (no pause between sentences).
+            counts = {"sent": 0, "done": 0}
+            counts_lock = threading.Lock()
+            sender_done = threading.Event()
+
+            def send_texts():
+                try:
+                    for text in texts:
+                        if stop_event.is_set():
+                            break
+                        self._proc.stdin.write((json.dumps({"text": text}) + "\n").encode())
+                        self._proc.stdin.flush()
+                        with counts_lock:
+                            counts["sent"] += 1
+                except Exception as e:  # worker died; the reader sees EOF
+                    logger.warning(f"Natural voice: could not send text: {e}")
+                finally:
+                    sender_done.set()
+
+            threading.Thread(target=send_texts, daemon=True).start()
+
+            stream = None
+            try:
+                while True:
+                    with counts_lock:
+                        outstanding = counts["sent"] - counts["done"]
+                    if outstanding == 0:
+                        if sender_done.is_set():
+                            with counts_lock:
+                                if counts["sent"] == counts["done"]:
+                                    break
+                            continue
+                        sender_done.wait(0.02)
+                        continue
+                    rate, length = struct.unpack("<II", self._read(8))
+                    if length == 0 and rate == 0:
+                        with counts_lock:
+                            counts["done"] += 1  # end of one text
+                        continue
+                    pcm = self._read(length)
+                    if stop_event.is_set():
+                        continue  # drain so the next request starts clean
+                    if stream is None or stream.samplerate != rate:
+                        if stream is not None:
+                            stream.stop()
+                            stream.close()
+                        stream = sd.RawOutputStream(samplerate=rate, channels=1, dtype="int16")
+                        stream.start()
+                    step = rate // 10 * 2  # 100 ms of audio, so Stop reacts quickly
+                    for i in range(0, len(pcm), step):
+                        if stop_event.is_set():
+                            stream.abort()
+                            break
+                        stream.write(pcm[i:i + step])
+            except EOFError:
+                self._proc = None
+                raise
+            finally:
+                if stream is not None:
+                    if not stream.stopped:
+                        if stop_event.is_set():
+                            stream.abort()
+                        else:
+                            stream.stop()  # let the last buffer finish playing
+                    stream.close()
+
+    def close(self):
+        if self._proc is not None and self._proc.poll() is None:
+            self._proc.kill()
+
+
+_piper = _PiperProcess()
+
+
+def shutdown():
+    """Stops the natural-voice process; call when the app closes."""
+    _piper.close()
+
+
 def _split_sentences(text: str, max_chars=TTS_CHUNK_CHARS):
     """Splits text into sentences, merging short ones up to max_chars."""
     sentences = [
@@ -242,12 +448,57 @@ def _split_sentences(text: str, max_chars=TTS_CHUNK_CHARS):
     return chunks
 
 
+class LiveSpeech:
+    """
+    Receives an answer's text while it is being written (feed) and hands
+    complete sentences to the speaker (sentences), so reading aloud starts
+    with the first sentence instead of after the whole answer.
+    feed() and finish() are called from the UI thread; sentences() is
+    consumed by the speaking thread.
+    """
+
+    # A sentence ends at . ! ? followed by whitespace (not after a digit, so
+    # list numbers like "1. " stay with their item), or at a line break.
+    _BOUNDARY = re.compile(r"(?<=[^\d\s][.!?])\s+|\n+")
+
+    def __init__(self):
+        self._pending = ""
+        self._queue = queue.Queue()
+
+    def feed(self, text):
+        self._pending += text
+        parts = self._BOUNDARY.split(self._pending)
+        for sentence in parts[:-1]:
+            if sentence.strip():
+                self._queue.put(sentence)
+        self._pending = parts[-1]
+
+    def finish(self):
+        if self._pending.strip():
+            self._queue.put(self._pending)
+        self._pending = ""
+        self._queue.put(None)
+
+    def sentences(self, stop_event):
+        while not stop_event.is_set():
+            try:
+                sentence = self._queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if sentence is None:
+                return
+            yield sentence
+
+
 class Speaker:
     """
-    Speaks text with the OS voices. speak() blocks; stop() is thread-safe.
-    Each Speaker is meant for a single utterance.
+    Speaks text with the natural Piper voice, or the OS voices if Piper is
+    unavailable. speak() blocks; stop() is thread-safe. Each Speaker is
+    meant for a single utterance.
 
-    On Windows, SAPI speaks asynchronously and stop() is polled every
+    Piper audio is played in 100 ms slices, so stop() takes effect almost
+    immediately. For the OS voices:
+    on Windows, SAPI speaks asynchronously and stop() is polled every
     100 ms, so speech stops almost immediately. Elsewhere (pyttsx3), text is
     spoken in sentence-sized chunks so stop() always takes effect at the
     next chunk boundary, or mid-sentence where the driver reports words as
@@ -259,9 +510,34 @@ class Speaker:
         self._stop_requested = threading.Event()
 
     def speak(self, text: str):
-        if not TTS_AVAILABLE:
+        """Speaks a complete text."""
+        self._speak_texts(iter([text]))
+
+    def speak_live(self, live: "LiveSpeech"):
+        """Speaks sentences as they arrive until live.finish() is called."""
+        self._speak_texts(live.sentences(self._stop_requested))
+
+    def _speak_texts(self, texts):
+        if not READ_ALOUD_AVAILABLE:
             raise RuntimeError(f"Read-aloud is unavailable: {TTS_IMPORT_ERROR}")
-        chunks = _split_sentences(text)
+        texts = (t for t in map(_clean_for_speech, texts) if t)
+        if PIPER_AVAILABLE:
+            try:
+                _piper.speak(texts, self._stop_requested)
+                return
+            except _PiperUnavailable as e:
+                logger.warning(f"Natural voice unavailable, using system voice: {e}")
+            except EOFError as e:
+                logger.warning(f"Natural voice stopped: {e}")
+                return
+            if self._stop_requested.is_set() or not TTS_AVAILABLE:
+                return
+        for text in texts:
+            if self._stop_requested.is_set():
+                break
+            self._speak_system(_split_sentences(text))
+
+    def _speak_system(self, chunks):
         if not chunks:
             return
         if sys.platform == "win32":
