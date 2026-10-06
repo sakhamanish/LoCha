@@ -54,6 +54,34 @@ Follow-up question: {question}
 Standalone question:"""
 )
 
+# Summaries: long documents are summarized in sections ("map"), then the
+# section notes are combined into one brief summary ("reduce").
+SUMMARY_SECTION_CHARS = 6000  # about 1500 tokens per call
+SUMMARY_MAX_SECTIONS = 8      # longer documents are sampled evenly
+
+SUMMARY_PART_PROMPT = PromptTemplate.from_template(
+    """Below is part {index} of {total} of a document.
+List the key points of this part in 2 to 4 short bullet points.
+Use only information from the text. Reply with the bullet points only.
+
+Text:
+{text}
+
+Key points:"""
+)
+
+SUMMARY_PROMPT = PromptTemplate.from_template(
+    """Below are {kind} a document.
+Write a brief summary for someone who has not read it: first one short
+paragraph giving the gist of the whole document, then 3 to 5 bullet points
+with its most important points. Use only information from the text below.
+Do not add a title.
+
+{text}
+
+Summary:"""
+)
+
 # ---------------- Logging ----------------
 logging.basicConfig(
     level=logging.INFO,
@@ -71,6 +99,8 @@ class LoChaEngine:
         self.file_hash = None
         self.index_ready = False
         self.document_text = ""
+        self.llm = None
+        self.summary = None
 
     def reset(self):
         logger.info("Resetting engine state")
@@ -81,6 +111,8 @@ class LoChaEngine:
         self.file_hash = None
         self.index_ready = False
         self.document_text = ""
+        self.llm = None
+        self.summary = None
 
     def load_document(self, file_path: str):
         logger.info(f"Loading document: {file_path}")
@@ -129,6 +161,7 @@ class LoChaEngine:
         # Ollama's default context window is small; 5 excerpts plus the
         # prompt can overflow it, silently cutting off the instructions.
         llm = Ollama(model="llama3.2:latest", temperature=0.2, num_ctx=8192)
+        self.llm = llm
 
         self.qa_chain = ConversationalRetrievalChain.from_llm(
             llm=llm,
@@ -227,9 +260,59 @@ class LoChaEngine:
         self.chat.insert(0, qa)
         return qa
 
+    def summarize(self, progress=None) -> str:
+        """
+        Returns a brief summary of the loaded document (cached per document).
+        progress(step, total) is called before each model call.
+        """
+        if not self.index_ready:
+            raise RuntimeError("Document not indexed yet")
+        if self.summary:
+            return self.summary
+
+        sections = RecursiveCharacterTextSplitter(
+            chunk_size=SUMMARY_SECTION_CHARS, chunk_overlap=0
+        ).split_text(self.document_text)
+        if not sections:
+            raise RuntimeError("The document has no readable text to summarize.")
+        if len(sections) > SUMMARY_MAX_SECTIONS:
+            last = len(sections) - 1
+            picks = sorted({
+                round(i * last / (SUMMARY_MAX_SECTIONS - 1))
+                for i in range(SUMMARY_MAX_SECTIONS)
+            })
+            logger.info(f"Summarizing {len(picks)} of {len(sections)} sections")
+            sections = [sections[i] for i in picks]
+
+        report = progress or (lambda step, total: None)
+        if len(sections) == 1:
+            report(1, 1)
+            summary = self.llm.invoke(
+                SUMMARY_PROMPT.format(kind="the contents of", text=sections[0])
+            )
+        else:
+            total = len(sections) + 1
+            notes = []
+            for i, section in enumerate(sections, 1):
+                report(i, total)
+                part = self.llm.invoke(SUMMARY_PART_PROMPT.format(
+                    index=i, total=len(sections), text=section
+                ))
+                notes.append(f"Part {i}:\n{part.strip()}")
+            report(total, total)
+            summary = self.llm.invoke(SUMMARY_PROMPT.format(
+                kind="notes on each part of", text="\n\n".join(notes)
+            ))
+
+        self.summary = summary.strip()
+        logger.info("Summary generated")
+        return self.summary
+
     def save_conversation(self, path: str):
         logger.info(f"Saving conversation to {path}")
         text = ""
+        if self.summary:
+            text += f"Document summary:\n{self.summary}\n" + "-" * 50 + "\n\n"
         for i, qa in enumerate(reversed(self.chat), 1):
             text += f"Question {i}: {qa['question']}\n"
             text += f"Answer: {qa['answer']}\n"

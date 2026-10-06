@@ -1,5 +1,6 @@
 import sys
 import os
+import html
 from PySide6.QtGui import QIcon, QTextCursor, QPixmap
 from PySide6.QtCore import Qt, Signal, QObject, QThread
 
@@ -100,6 +101,30 @@ class AskQuestionWorker(QObject):
             self.error.emit(str(e))
         finally:
             self.finished.emit()
+
+
+class SummarizeWorker(QObject):
+    finished = Signal()
+    status_update = Signal(str)
+    result_ready = Signal(str)
+    error = Signal(str)
+
+    def run(self):
+        try:
+            self.result_ready.emit(engine.summarize(progress=self.report))
+        except Exception as e:
+            self.error.emit(str(e))
+        finally:
+            self.finished.emit()
+
+    def report(self, step, total):
+        if total == 1:
+            msg = "Summarizing the document…"
+        elif step < total:
+            msg = f"Summarizing the document… part {step} of {total - 1}"
+        else:
+            msg = "Summarizing the document… writing the summary"
+        self.status_update.emit(f"<b style='font-size:16px; color:#2E7D32;'>{msg}</b>")
 
 
 class TranscribeWorker(QObject):
@@ -206,9 +231,10 @@ class LoChaApp(QWidget):
         # ---------- Buttons ----------
         btn_layout = QHBoxLayout()
         self.load_btn = QPushButton("Load PDF / DOCX")
+        self.summarize_btn = QPushButton("Summarize")
         self.save_btn = QPushButton("Save Conversation")
 
-        for btn in (self.load_btn, self.save_btn):
+        for btn in (self.load_btn, self.summarize_btn, self.save_btn):
             btn.setFixedSize(200, 50)
             btn.setStyleSheet("""
                 QPushButton {
@@ -229,13 +255,16 @@ class LoChaApp(QWidget):
         self.stop_speaking_btn = QPushButton("Stop speaking")
         self.stop_speaking_btn.setFixedSize(140, 40)
         self.stop_speaking_btn.setEnabled(False)
-        if not voice.TTS_AVAILABLE:
+        if not voice.READ_ALOUD_AVAILABLE:
             self.read_aloud_cb.setEnabled(False)
             self.read_aloud_cb.setToolTip(
-                "Read-aloud unavailable. Install it with: pip install pyttsx3"
+                "Read-aloud unavailable. Install it with: pip install piper-tts pyttsx3"
             )
 
+        self.summarize_btn.setToolTip("Get a brief overview of the whole document")
+
         btn_layout.addWidget(self.load_btn)
+        btn_layout.addWidget(self.summarize_btn)
         btn_layout.addStretch()
         btn_layout.addWidget(self.read_aloud_cb)
         btn_layout.addWidget(self.stop_speaking_btn)
@@ -290,6 +319,7 @@ class LoChaApp(QWidget):
         self.load_btn.clicked.connect(self.load_document)
         self.ask_btn.clicked.connect(self.ask_question)
         self.save_btn.clicked.connect(self.save_chat)
+        self.summarize_btn.clicked.connect(self.summarize_document)
         self.question_input.returnPressed.connect(self.ask_question)
         self.mic_btn.clicked.connect(self.toggle_recording)
         self.stop_speaking_btn.clicked.connect(self.stop_speaking)
@@ -326,7 +356,7 @@ class LoChaApp(QWidget):
 
     def ask_question(self):
         question = self.question_input.text().strip()
-        if not question:
+        if not question or self.asking:
             return
         if not engine.index_ready:
             QMessageBox.warning(self, "Warning", "Document not loaded yet.")
@@ -359,6 +389,61 @@ class LoChaApp(QWidget):
         )
         if self.read_aloud_cb.isChecked() and engine.chat:
             self.speak(engine.chat[0]["answer"])
+
+    def summarize_document(self):
+        if not engine.index_ready:
+            QMessageBox.warning(self, "Warning", "Document not loaded yet.")
+            return
+        if self.asking:
+            return
+
+        self.asking = True
+        self.summarize_btn.setEnabled(False)
+        self.update_mic_state()
+
+        self.summary_thread = QThread()
+        self.summary_worker = SummarizeWorker()
+        self.summary_worker.moveToThread(self.summary_thread)
+
+        self.summary_thread.started.connect(self.summary_worker.run)
+        self.summary_worker.status_update.connect(self.update_status)
+        self.summary_worker.result_ready.connect(self.display_summary)
+        self.summary_worker.error.connect(self.show_error)
+        self.summary_worker.finished.connect(self.on_summary_finished)
+        self.summary_worker.finished.connect(self.summary_thread.quit)
+        self.summary_worker.finished.connect(self.summary_worker.deleteLater)
+        self.summary_thread.finished.connect(self.summary_thread.deleteLater)
+
+        self.summary_thread.start()
+
+    def display_summary(self, summary):
+        lines = []
+        for line in summary.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            bullet = line[:2] in ("- ", "* ", "• ")
+            line = html.escape(line[2:] if bullet else line)
+            line = line.replace("**", "")
+            lines.append(f"• {line}" if bullet else line)
+        summary_html = (
+            '<span style="font-size:16px; font-weight:bold;">Document summary</span><br>'
+            '<div style="background-color:#e8f0fe; padding:8px;">'
+            f'<p style="font-size:16px;">{"<br>".join(lines)}</p>'
+            '</div>'
+        )
+        self.answer_box.moveCursor(QTextCursor.Start)
+        self.answer_box.insertHtml(summary_html + "<hr>")
+        self.status.setText(
+            "<b style='font-size:16px; color:#2E7D32;'>Summary ready. Ask a question for details.</b>"
+        )
+        if self.read_aloud_cb.isChecked():
+            self.speak(summary)
+
+    def on_summary_finished(self):
+        self.asking = False
+        self.summarize_btn.setEnabled(True)
+        self.update_mic_state()
 
     def on_ask_finished(self):
         self.asking = False
@@ -486,6 +571,7 @@ class LoChaApp(QWidget):
         if recorder.is_recording:
             recorder.stop()
         self.stop_speaking()
+        voice.shutdown()
         super().closeEvent(event)
 
     def update_status(self, msg):
@@ -496,7 +582,7 @@ class LoChaApp(QWidget):
         self.status.setText("Error")
 
     def save_chat(self):
-        if not engine.chat:
+        if not engine.chat and not engine.summary:
             QMessageBox.information(self, "Info", "No conversation to save.")
             return
         path, _ = QFileDialog.getSaveFileName(
