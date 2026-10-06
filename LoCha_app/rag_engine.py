@@ -2,9 +2,24 @@ import os
 import json
 import hashlib
 import logging
+import threading
 import urllib.request
 
+from langchain_core.callbacks import BaseCallbackHandler
+
 LLM_MODEL = "llama3.2:latest"
+EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+CHUNK_SIZE = 800
+CHUNK_OVERLAP = 150
+
+# Each document's search index, text and summary are cached here, keyed by
+# a hash of the file's contents, so reopening it skips parsing and
+# embedding. Changing the version, model or chunking invalidates the cache.
+INDEX_CACHE_VERSION = f"v1-{EMBEDDING_MODEL}-{CHUNK_SIZE}-{CHUNK_OVERLAP}"
+CACHE_DIR = os.path.join(
+    os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), ".cache"),
+    "LoCha", "index",
+)
 OLLAMA_URL = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 if not OLLAMA_URL.startswith("http"):
     OLLAMA_URL = "http://" + OLLAMA_URL
@@ -109,6 +124,26 @@ Summary:"""
 MATCH_STRONG = 0.55
 MATCH_MODERATE = 0.35
 
+class _AnswerStreamer(BaseCallbackHandler):
+    """Passes the answer's tokens to on_token as the model writes them.
+    The chain also calls the model to rewrite follow-up questions; those
+    calls are recognized by their prompt and not streamed."""
+
+    def __init__(self, on_token):
+        self.on_token = on_token
+        self.active = False
+
+    def on_llm_start(self, serialized, prompts, **kwargs):
+        self.active = bool(prompts) and prompts[0].startswith("You are LoCha")
+
+    def on_llm_new_token(self, token, **kwargs):
+        if self.active and token:
+            self.on_token(token)
+
+    def on_llm_end(self, response, **kwargs):
+        self.active = False
+
+
 def format_match(qa: dict) -> str:
     if qa.get("match_score") is None:
         return "not available"
@@ -125,6 +160,8 @@ logger = logging.getLogger(__name__)
 
 class LoChaEngine:
     def __init__(self):
+        self._embeddings = None
+        self._embeddings_lock = threading.Lock()
         self.vectorstore = None
         self.qa_chain = None
         self.memory = None
@@ -134,6 +171,7 @@ class LoChaEngine:
         self.document_text = ""
         self.llm = None
         self.summary = None
+        self.cache_path = None
 
     def reset(self):
         logger.info("Resetting engine state")
@@ -146,44 +184,56 @@ class LoChaEngine:
         self.document_text = ""
         self.llm = None
         self.summary = None
+        self.cache_path = None
+
+    def warm_up(self):
+        """Loads the embedding model ahead of time (call in the background
+        at startup) so the first document loads quickly."""
+        try:
+            self._get_embeddings()
+        except Exception as e:
+            logger.warning(f"Embedding model warm-up failed: {e}")
+
+    def _get_embeddings(self):
+        with self._embeddings_lock:
+            if self._embeddings is None:
+                # Normalized vectors make FAISS's squared L2 distance map
+                # directly to cosine similarity (used for the source match).
+                self._embeddings = HuggingFaceEmbeddings(
+                    model_name=EMBEDDING_MODEL,
+                    encode_kwargs={"normalize_embeddings": True},
+                )
+            return self._embeddings
 
     def load_document(self, file_path: str):
         logger.info(f"Loading document: {file_path}")
 
         with open(file_path, "rb") as f:
-            file_bytes = f.read()
-
-        new_hash = hashlib.md5(file_bytes).hexdigest()
-        if new_hash == self.file_hash:
-            logger.info("Same document detected, skipping re-index")
-            return
+            digest = hashlib.sha256(f.read()).hexdigest()
 
         self.reset()
-        self.file_hash = new_hash
+        self.file_hash = digest
+        self.cache_path = os.path.join(CACHE_DIR, digest)
+        embeddings = self._get_embeddings()
 
-        suffix = os.path.splitext(file_path)[1].lower()
-        loader = PyPDFLoader(file_path) if suffix == ".pdf" else Docx2txtLoader(file_path)
+        if not self._load_from_cache(embeddings):
+            suffix = os.path.splitext(file_path)[1].lower()
+            loader = PyPDFLoader(file_path) if suffix == ".pdf" else Docx2txtLoader(file_path)
 
-        docs = loader.load()
-        for d in docs:
-            d.metadata["source"] = os.path.basename(file_path)
-        self.document_text = "\n".join(d.page_content for d in docs)
+            docs = loader.load()
+            for d in docs:
+                d.metadata["source"] = os.path.basename(file_path)
+            self.document_text = "\n".join(d.page_content for d in docs)
 
-        splitter = RecursiveCharacterTextSplitter(
-            chunk_size=800,
-            chunk_overlap=150
-        )
-        chunks = splitter.split_documents(docs)
-        logger.info(f"Document split into {len(chunks)} chunks")
+            splitter = RecursiveCharacterTextSplitter(
+                chunk_size=CHUNK_SIZE,
+                chunk_overlap=CHUNK_OVERLAP
+            )
+            chunks = splitter.split_documents(docs)
+            logger.info(f"Document split into {len(chunks)} chunks")
 
-        # Normalized vectors make FAISS's squared L2 distance map directly
-        # to cosine similarity (used for the source-match indicator).
-        embeddings = HuggingFaceEmbeddings(
-            model_name="sentence-transformers/all-MiniLM-L6-v2",
-            encode_kwargs={"normalize_embeddings": True},
-        )
-
-        self.vectorstore = FAISS.from_documents(chunks, embeddings)
+            self.vectorstore = FAISS.from_documents(chunks, embeddings)
+            self._save_to_cache()
 
         # Keep only the last few exchanges: the full history is sent with
         # every follow-up and would otherwise overflow the context window.
@@ -213,13 +263,58 @@ class LoChaEngine:
         self.index_ready = True
         logger.info("Document indexed successfully")
 
-    def ask(self, question: str) -> dict:
+    # ---------------- Index cache ----------------
+    def _load_from_cache(self, embeddings) -> bool:
+        path = self.cache_path
+        try:
+            with open(os.path.join(path, "meta.json"), encoding="utf-8") as f:
+                if json.load(f).get("version") != INDEX_CACHE_VERSION:
+                    return False
+            # The cache only ever contains files LoCha wrote itself.
+            self.vectorstore = FAISS.load_local(
+                path, embeddings, allow_dangerous_deserialization=True
+            )
+            with open(os.path.join(path, "document.txt"), encoding="utf-8") as f:
+                self.document_text = f.read()
+            summary_file = os.path.join(path, "summary.txt")
+            if os.path.exists(summary_file):
+                with open(summary_file, encoding="utf-8") as f:
+                    self.summary = f.read() or None
+        except FileNotFoundError:
+            return False
+        except Exception as e:
+            logger.warning(f"Ignoring unreadable index cache ({e}); re-indexing")
+            self.vectorstore = None
+            self.document_text = ""
+            self.summary = None
+            return False
+        logger.info("Loaded document index from cache (skipped re-indexing)")
+        return True
+
+    def _save_to_cache(self):
+        path = self.cache_path
+        try:
+            os.makedirs(path, exist_ok=True)
+            self.vectorstore.save_local(path)
+            with open(os.path.join(path, "document.txt"), "w", encoding="utf-8") as f:
+                f.write(self.document_text)
+            # Written last: a cache entry only counts once it is complete.
+            with open(os.path.join(path, "meta.json"), "w", encoding="utf-8") as f:
+                json.dump({"version": INDEX_CACHE_VERSION}, f)
+        except Exception as e:
+            logger.warning(f"Could not cache the document index: {e}")
+
+    def ask(self, question: str, on_token=None) -> dict:
+        """on_token(text), if given, receives the answer as it is written."""
         if not self.index_ready:
             raise RuntimeError("Document not indexed yet")
 
         logger.info(f"Question received: {question}")
         check_ollama()
-        result = self.qa_chain.invoke({"question": question})
+        callbacks = [_AnswerStreamer(on_token)] if on_token else []
+        result = self.qa_chain.invoke(
+            {"question": question}, config={"callbacks": callbacks}
+        )
 
         answer = result["answer"]
         sources = result.get("source_documents", [])
@@ -343,6 +438,12 @@ class LoChaEngine:
 
         self.summary = summary.strip()
         logger.info("Summary generated")
+        if self.cache_path and os.path.isdir(self.cache_path):
+            try:
+                with open(os.path.join(self.cache_path, "summary.txt"), "w", encoding="utf-8") as f:
+                    f.write(self.summary)
+            except Exception as e:
+                logger.warning(f"Could not cache the summary: {e}")
         return self.summary
 
     def save_conversation(self, path: str):

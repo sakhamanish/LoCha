@@ -49,3 +49,8 @@ A weak match means the document probably doesn't cover the question, so treat th
 Troubleshooting:
 If LoCha says "Ollama isn't running", start the Ollama app (or run "ollama serve"), then ask again.
 If it says the model isn't downloaded, run: ollama pull llama3.2:latest
+
+Faster answers and reloading:
+Answers appear word by word as they are written, so you can start reading straight away.
+The first time you load a document, LoCha indexes it and saves the index on your computer. Loading the same file again (even after restarting LoCha) skips re-indexing and is almost instant; a summary you already made is kept too. A changed file counts as a new document.
+The saved indexes are in %LOCALAPPDATA%\LoCha\index on Windows (~/.cache/LoCha/index on macOS/Linux). They are small, stay on your computer, and can be deleted at any time to free space.

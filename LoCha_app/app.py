@@ -2,7 +2,8 @@ import sys
 import os
 import re
 import html
-from PySide6.QtGui import QIcon, QTextCursor, QPixmap
+import threading
+from PySide6.QtGui import QIcon, QTextCursor, QPixmap, QTextCharFormat, QFont
 from PySide6.QtCore import Qt, Signal, QObject, QThread, QTimer
 
 from PySide6.QtWidgets import (
@@ -79,6 +80,8 @@ class LoadDocumentWorker(QObject):
 class AskQuestionWorker(QObject):
     finished = Signal()
     status_update = Signal(str)
+    answer_started = Signal(str)  # question HTML
+    token = Signal(str)           # answer text as the model writes it
     result_ready = Signal(str, str)
     error = Signal(str)
 
@@ -91,12 +94,12 @@ class AskQuestionWorker(QObject):
             self.status_update.emit(
                 "<b style='font-size:16px; color:#2E7D32;'>Contemplating question...</b>"
             )
-            qa = engine.ask(self.question)
-
             question_html = (
                 f'<span style="font-size:16px; font-weight:bold;">'
-                f'Question: {text_to_html(qa["question"])}</span><br>'
+                f'Question: {text_to_html(self.question)}</span><br>'
             )
+            self.answer_started.emit(question_html)
+            qa = engine.ask(self.question, on_token=self.token.emit)
 
             match_color = MATCH_COLORS.get(qa["match"], "#555")
             answer_html = (
@@ -262,6 +265,9 @@ class LoChaApp(QWidget):
                 QPushButton:hover {
                     background-color: #357ABD;
                 }
+                QPushButton:disabled {
+                    background-color: #A0A0A0;
+                }
             """)
 
         # ---------- Read-aloud controls ----------
@@ -320,6 +326,9 @@ class LoChaApp(QWidget):
             QPushButton:hover {
                 background-color: #357ABD;
             }
+            QPushButton:disabled {
+                background-color: #A0A0A0;
+            }
         """)
         question_layout.addWidget(self.ask_btn)
         layout.addLayout(question_layout)
@@ -344,6 +353,8 @@ class LoChaApp(QWidget):
         self.tts_worker = None
         self.tts_jobs = []  # keeps (thread, worker) alive until speech ends
         self.asking = False  # loading, answering or summarizing
+        self.live_cursor = None  # answer being streamed, if any
+        self.live_has_text = False
 
         QTimer.singleShot(0, self.check_ollama_on_start)
 
@@ -409,6 +420,8 @@ class LoChaApp(QWidget):
 
         self.thread.started.connect(self.worker.run)
         self.worker.status_update.connect(self.update_status)
+        self.worker.answer_started.connect(self.start_live_answer)
+        self.worker.token.connect(self.append_live_answer)
         self.worker.result_ready.connect(self.display_answer)
         self.worker.error.connect(self.show_error)
         self.worker.finished.connect(self.on_ask_finished)
@@ -418,7 +431,51 @@ class LoChaApp(QWidget):
 
         self.thread.start()
 
+    # ---------- Streaming answer ----------
+    def start_live_answer(self, question_html):
+        """Shows the question and an empty answer at the top; tokens are
+        appended as plain text until the formatted answer replaces it."""
+        cursor = QTextCursor(self.answer_box.document())
+        cursor.movePosition(QTextCursor.Start)
+        # Two empty blocks keep the live answer apart from older answers.
+        cursor.insertBlock()
+        cursor.insertBlock()
+        cursor.movePosition(QTextCursor.Start)
+        cursor.insertHtml(
+            question_html
+            + '<br><span style="font-size:16px; font-weight:bold;">Answer:</span><br>'
+        )
+        fmt = QTextCharFormat()
+        fmt.setFontPointSize(12)
+        fmt.setFontWeight(QFont.Normal)
+        cursor.setCharFormat(fmt)
+        self.live_cursor = cursor
+        self.live_has_text = False
+        self.answer_box.moveCursor(QTextCursor.Start)
+
+    def append_live_answer(self, token):
+        if self.live_cursor is None:
+            return
+        if not self.live_has_text:
+            self.live_has_text = True
+            self.status.setText(
+                "<b style='font-size:16px; color:#2E7D32;'>Writing the answer…</b>"
+            )
+        self.live_cursor.insertText(token)
+
+    def remove_live_answer(self):
+        if self.live_cursor is None:
+            return
+        doc = self.answer_box.document()
+        end = min(self.live_cursor.position() + 2, doc.characterCount() - 1)
+        cursor = QTextCursor(doc)
+        cursor.setPosition(0)
+        cursor.setPosition(end, QTextCursor.KeepAnchor)
+        cursor.removeSelectedText()
+        self.live_cursor = None
+
     def display_answer(self, q_html, a_html):
+        self.remove_live_answer()
         self.answer_box.moveCursor(QTextCursor.Start)
         self.answer_box.insertHtml(q_html + a_html + "<hr>")
         self.question_input.clear()
@@ -479,6 +536,7 @@ class LoChaApp(QWidget):
         self.set_busy(False)
 
     def on_ask_finished(self):
+        self.remove_live_answer()  # left over only if answering failed
         self.set_busy(False)
 
     # ---------------- Voice ----------------
@@ -627,6 +685,9 @@ class LoChaApp(QWidget):
 
 # ---------------- Entry ----------------
 if __name__ == "__main__":
+    # Load the embedding model while the window opens, so the first
+    # document (especially a cached one) loads quickly.
+    threading.Thread(target=engine.warm_up, daemon=True).start()
     app = QApplication(sys.argv)
     window = LoChaApp()
     window.show()
