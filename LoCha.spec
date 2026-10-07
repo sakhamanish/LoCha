@@ -1,10 +1,18 @@
 # -*- mode: python ; coding: utf-8 -*-
 # PyInstaller recipe for LoCha.exe. Build on Windows with build_exe.ps1
 # (or: pyinstaller LoCha.spec --noconfirm). Output: dist\LoCha\LoCha.exe
+#
+# Two programs share the dist\LoCha folder:
+# - LoCha.exe: the app (PySide6, torch, LangChain, speech recognition).
+# - LoChaVoice.exe: the natural-voice worker (Piper + onnxruntime).
+# They must be built separately: on Windows onnxruntime crashes when loaded
+# alongside torch/PySide6, and PyInstaller imports all of an exe's packages
+# together while building, so a single exe with both fails to build.
 from PyInstaller.utils.hooks import (
     collect_data_files, collect_dynamic_libs, collect_submodules,
 )
 
+# ---------------- LoCha.exe ----------------
 datas = [("LoCha_app/LoCha_icon.ico", ".")]  # app.py looks for it next to the exe
 binaries = []
 hiddenimports = [
@@ -26,28 +34,25 @@ hiddenimports += collect_submodules("langchain.chains.conversational_retrieval")
 # The embedding model's config names these modules; they're loaded by name.
 hiddenimports += collect_submodules("sentence_transformers")
 
-# Natural voice: Piper code (not its training tools), espeak-ng data and libraries.
-hiddenimports += collect_submodules("piper", filter=lambda name: not name.startswith("piper.train"))
-datas += collect_data_files("piper", excludes=["**/train/**"])
-binaries += collect_dynamic_libs("piper")
-
 # Speech recognition.
 datas += collect_data_files("faster_whisper")
 binaries += collect_dynamic_libs("ctranslate2")
 
-a = Analysis(
+app = Analysis(
     ["run_locha.py"],
     pathex=[],
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
-    excludes=["tkinter", "matplotlib", "IPython", "pytest", "piper.train"],
+    # onnxruntime and Piper belong to LoChaVoice.exe only (see above). LoCha
+    # doesn't use faster-whisper's VAD or transformers' ONNX export, which
+    # are what would pull onnxruntime in.
+    excludes=["tkinter", "matplotlib", "IPython", "pytest", "onnxruntime", "piper"],
     noarchive=False,
 )
-pyz = PYZ(a.pure)
-exe = EXE(
-    pyz,
-    a.scripts,
+app_exe = EXE(
+    PYZ(app.pure),
+    app.scripts,
     [],
     exclude_binaries=True,
     name="LoCha",
@@ -55,4 +60,36 @@ exe = EXE(
     console=False,  # windowed app; output goes to %LOCALAPPDATA%\LoCha\locha.log
     upx=False,
 )
-coll = COLLECT(exe, a.binaries, a.datas, name="LoCha", upx=False)
+
+# ---------------- LoChaVoice.exe ----------------
+voice = Analysis(
+    ["LoCha_app/tts_worker.py"],
+    pathex=[],
+    binaries=collect_dynamic_libs("piper"),
+    datas=collect_data_files("piper", excludes=["**/train/**"]),
+    hiddenimports=collect_submodules("piper", filter=lambda name: not name.startswith("piper.train")),
+    # Keep the app's heavy packages out (and away from onnxruntime).
+    excludes=[
+        "tkinter", "matplotlib", "IPython", "pytest", "piper.train",
+        "torch", "torchvision", "transformers", "sentence_transformers",
+        "PySide6", "shiboken6", "langchain", "langchain_core", "langchain_community",
+        "scipy", "sklearn", "pandas", "faster_whisper", "ctranslate2",
+    ],
+    noarchive=False,
+)
+voice_exe = EXE(
+    PYZ(voice.pure),
+    voice.scripts,
+    [],
+    exclude_binaries=True,
+    name="LoChaVoice",
+    console=False,
+    upx=False,
+)
+
+coll = COLLECT(
+    app_exe, app.binaries, app.datas,
+    voice_exe, voice.binaries, voice.datas,
+    name="LoCha",
+    upx=False,
+)

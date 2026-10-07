@@ -66,7 +66,16 @@ except Exception as e:
     TTS_AVAILABLE = False
     TTS_IMPORT_ERROR = str(e)
 
-PIPER_AVAILABLE = sd is not None and importlib.util.find_spec("piper") is not None
+# In LoCha.exe the natural voice is the separate LoChaVoice.exe next to it
+# (see LoCha.spec); from source it's "python tts_worker.py".
+FROZEN = getattr(sys, "frozen", False)
+VOICE_EXE = os.path.join(
+    os.path.dirname(sys.executable),
+    "LoChaVoice.exe" if sys.platform == "win32" else "LoChaVoice",
+)
+PIPER_AVAILABLE = sd is not None and (
+    os.path.exists(VOICE_EXE) if FROZEN else importlib.util.find_spec("piper") is not None
+)
 READ_ALOUD_AVAILABLE = PIPER_AVAILABLE or TTS_AVAILABLE
 
 
@@ -314,9 +323,8 @@ class _PiperProcess:
             raise
 
     def _start(self):
-        if getattr(sys, "frozen", False):
-            # LoCha.exe runs the worker itself (see run_locha.py).
-            command = [sys.executable, "--tts-worker"]
+        if FROZEN:
+            command = [VOICE_EXE]
         else:
             command = [sys.executable, os.path.join(
                 os.path.dirname(os.path.abspath(__file__)), "tts_worker.py"

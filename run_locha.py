@@ -1,11 +1,6 @@
 """
-Entry point for LoCha.exe (PyInstaller) and an alternative way to run LoCha
-from source: python run_locha.py
-
-LoCha.exe also serves as the natural-voice worker: voice.py starts
-"LoCha.exe --tts-worker <voice.onnx>" as a separate process. That process
-must not import the app (PySide6/torch): Piper's onnxruntime crashes on
-Windows when loaded alongside them.
+Entry point for LoCha.exe (PyInstaller, see LoCha.spec) and an alternative
+way to run LoCha from source: python run_locha.py
 """
 
 import os
@@ -29,10 +24,6 @@ def _log_to_file():
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 2 and sys.argv[1] == "--tts-worker":
-        from LoCha_app import tts_worker
-        tts_worker.main(sys.argv[2])
-    else:
-        _log_to_file()
-        from LoCha_app.app import main
-        main()
+    _log_to_file()
+    from LoCha_app.app import main
+    main()

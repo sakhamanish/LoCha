@@ -3,7 +3,8 @@ Piper text-to-speech worker for LoCha's natural voice.
 
 voice.py runs this file in its own process: Piper uses onnxruntime, whose
 DLLs crash on Windows when loaded into the same process as torch and
-PySide6. Nothing from LoCha is imported here.
+PySide6. Nothing from LoCha is imported here. In the Windows build this
+file is its own program, LoChaVoice.exe (see LoCha.spec).
 
 Protocol (stdin/stdout):
 - After loading the voice, the worker writes b"RDY0".
