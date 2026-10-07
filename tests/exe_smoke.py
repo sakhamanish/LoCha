@@ -122,7 +122,13 @@ def main():
         audio = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768
         audio = voice._resample(audio, rate, voice.TARGET_SAMPLE_RATE)
         text = voice.Transcriber().transcribe(audio)
-        check("speech-to-text (Whisper) after torch is loaded", "payment" in text.lower(), repr(text))
+        # This checks that speech-to-text runs inside the exe, not the model's
+        # accuracy: the test uses the tiny model and Piper's voice varies
+        # between runs (once heard as "Where are the painted terms?").
+        expected = {"what", "are", "the", "payment", "terms"}
+        heard = {w.strip(".,?!").lower() for w in text.split()}
+        check("speech-to-text (Whisper) after torch is loaded",
+              len(expected & heard) >= 3, repr(text))
 
     # ---- window ----
     from PySide6.QtCore import QCoreApplication
