@@ -1,12 +1,22 @@
-# Builds LoCha.exe on Windows and tests it.
+# Builds LoCha.exe on Windows and tests it; optionally publishes a release.
 #
 # Runs only when asked: from the Actions tab ("Run workflow"), or on a push
 # whose commit message contains [build-exe]. Ordinary pushes don't start it.
+# Entering a version (e.g. v1.0.0) when running it from the Actions tab also
+# publishes a GitHub Release with the tested Windows zip.
 name: Windows exe build
 
 on:
   workflow_dispatch:
+    inputs:
+      release_version:
+        description: "Release version to publish (e.g. v1.0.0). Leave empty to only build and test."
+        required: false
+        default: ""
   push:
+
+permissions:
+  contents: write  # to publish releases
 
 jobs:
   build:
@@ -94,3 +104,39 @@ jobs:
             throw "Errors in locha.log (see above)"
           }
           Write-Host "LoCha.exe from the downloaded zip ran for 90 seconds without errors."
+
+      - name: Package the release zip and check LoCha.exe starts from it
+        if: github.event_name == 'workflow_dispatch' && inputs.release_version != ''
+        env:
+          VERSION: ${{ inputs.release_version }}
+        run: |
+          if ($env:VERSION -notmatch '^v\d+\.\d+\.\d+$') { throw "Version must look like v1.0.0" }
+          $zip = "LoCha-$env:VERSION-windows.zip"
+          # 7-Zip keeps hidden folders such as sklearn\.libs (Compress-Archive doesn't).
+          7z a -tzip -mx=9 $zip .\dist\LoCha\* | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "Packaging failed" }
+          7z x $zip -orelease-check | Out-Null
+          $env:OLLAMA_HOST = "127.0.0.1:1"
+          $env:LOCALAPPDATA = Join-Path $env:RUNNER_TEMP "release-appdata"
+          $app = Start-Process release-check\LoCha.exe -PassThru
+          Start-Sleep -Seconds 90
+          $log = Join-Path $env:LOCALAPPDATA "LoCha\locha.log"
+          if (Test-Path $log) { Get-Content $log }
+          if ($app.HasExited) { throw "LoCha.exe from the release zip stopped early (exit code $($app.ExitCode))" }
+          Stop-Process -Id $app.Id -Force
+          if ((Test-Path $log) -and (Select-String -Path $log -Pattern "Traceback|warm-up failed" -Quiet)) {
+            throw "Errors in locha.log (see above)"
+          }
+          Write-Host "Release zip OK: $zip ($([math]::Round((Get-Item $zip).Length / 1MB)) MB)"
+
+      - name: Publish the GitHub Release
+        if: github.event_name == 'workflow_dispatch' && inputs.release_version != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.release_version }}
+        run: |
+          gh release create $env:VERSION "LoCha-$env:VERSION-windows.zip" `
+            --target $env:GITHUB_SHA `
+            --title "LoCha $env:VERSION" `
+            --notes-file .github/release-notes.md
+          if ($LASTEXITCODE -ne 0) { throw "Publishing the release failed" }
