@@ -60,6 +60,7 @@ jobs:
 
       - name: Upload the LoCha folder
         # Large (torch); may not fit a free plan's artifact storage.
+        id: upload
         continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
@@ -67,3 +68,29 @@ jobs:
           path: dist/LoCha
           retention-days: 3
           compression-level: 9
+          # Keep folders starting with "." (e.g. sklearn\.libs\vcomp140.dll);
+          # by default they're left out and the downloaded LoCha.exe fails.
+          include-hidden-files: true
+
+      - name: Download the uploaded zip and check LoCha.exe starts from it
+        if: steps.upload.outcome == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          name: LoCha-windows
+          path: downloaded
+
+      - name: Start LoCha.exe from the downloaded zip
+        if: steps.upload.outcome == 'success'
+        run: |
+          $env:OLLAMA_HOST = "127.0.0.1:1"
+          $env:LOCALAPPDATA = Join-Path $env:RUNNER_TEMP "downloaded-appdata"
+          $app = Start-Process downloaded\LoCha.exe -PassThru
+          Start-Sleep -Seconds 90
+          $log = Join-Path $env:LOCALAPPDATA "LoCha\locha.log"
+          if (Test-Path $log) { Get-Content $log }
+          if ($app.HasExited) { throw "LoCha.exe from the download stopped early (exit code $($app.ExitCode))" }
+          Stop-Process -Id $app.Id -Force
+          if ((Test-Path $log) -and (Select-String -Path $log -Pattern "Traceback|warm-up failed" -Quiet)) {
+            throw "Errors in locha.log (see above)"
+          }
+          Write-Host "LoCha.exe from the downloaded zip ran for 90 seconds without errors."

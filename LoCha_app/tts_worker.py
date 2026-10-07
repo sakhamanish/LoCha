@@ -69,4 +69,14 @@ def main(model_path=None):
 
 
 if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        # Opened directly (e.g. double-clicking LoChaVoice.exe). LoCha starts
+        # this helper itself and passes it the voice file.
+        message = "This is LoCha's voice helper; it runs in the background.\nOpen LoCha.exe instead."
+        if sys.platform == "win32":
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(None, message, "LoCha", 0x40)  # information icon
+        else:
+            print(message, file=sys.stderr)
+        sys.exit(1)
     main()
