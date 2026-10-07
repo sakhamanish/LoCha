@@ -54,3 +54,13 @@ Faster answers and reloading:
 Answers appear as they are written, at a steady reading pace (about the speed of the voice, so the two stay in step), and with read-aloud on the voice starts with the first sentence. To change the pace, set LOCHA_TEXT_SPEED to the characters per second you want (default 22) before starting LoCha.
 The first time you load a document, LoCha indexes it and saves the index on your computer. Loading the same file again (even after restarting LoCha) skips re-indexing and is almost instant; a summary you already made is kept too. A changed file counts as a new document.
 The saved indexes are in %LOCALAPPDATA%\LoCha\index on Windows (~/.cache/LoCha/index on macOS/Linux). They are small, stay on your computer, and can be deleted at any time to free space.
+
+Build LoCha.exe (Windows):
+1. Set up the project as in "Run from source" (Python 3.11, .venv, pip install -r requirements.txt) and check LoCha runs.
+2. In PowerShell, from the LoCha folder: .\build_exe.ps1
+   (or: pip install pyinstaller==6.22.3, then: pyinstaller LoCha.spec --noconfirm --clean)
+3. The app is in dist\LoCha. Start it with dist\LoCha\LoCha.exe. Keep the whole dist\LoCha folder together: LoCha.exe needs the _internal folder and LoChaVoice.exe (the natural voice) next to it.
+To use LoCha on another PC, copy (or zip) the dist\LoCha folder. That PC also needs Ollama with the model (ollama pull llama3.2:latest), and an internet connection the first time, to download the search, speech and voice models.
+LoCha.exe has no console window: its messages go to %LOCALAPPDATA%\LoCha\locha.log, which is the place to look if something goes wrong.
+Windows may show a SmartScreen warning the first time, because the exe isn't code-signed: click "More info", then "Run anyway".
+The build is also tested automatically on a Windows machine by GitHub Actions (.github/workflows/windows-exe.yml). It runs only when started from the Actions tab or by a commit whose message contains [build-exe].

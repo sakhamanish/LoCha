@@ -8,8 +8,9 @@ dist/
 # Log files
 locha_debug.log
 
-# Pyinstaller spec file
+# Pyinstaller spec files (except LoCha's build recipe)
 *.spec
+!LoCha.spec
 
 # Python bytecode cache
 __pycache__/
